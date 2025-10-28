@@ -14,10 +14,27 @@ from dotenv import load_dotenv
 # Load .env file
 load_dotenv()
 
+# ===== DISCORD HELPER =====
+def send_discord(message: str, webhook_url: str):
+    """Send a message to Discord via webhook."""
+    if not webhook_url:
+        print("⚠️ Discord webhook URL not configured.")
+        return
+
+    try:
+        payload = {"content": message}
+        r = requests.post(webhook_url, json=payload, timeout=10)
+        if r.status_code in (200, 204):
+            print("✅ Message sent to Discord successfully.")
+        else:
+            print(f"⚠️ Discord returned status {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"❌ Failed to send message to Discord: {e}")
+
 # ===== ENV KEYS =====
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 SPORTSDATA_API_KEY_NFL = os.getenv("SPORTSDATA_API_KEY_NFL", "").strip()
-DISCORD_WEBHOOK_ = os.getenv("DISCORD_WEBHOOK", "").strip()
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 
 # ===== TIME HELPERS =====
 def now_miami():

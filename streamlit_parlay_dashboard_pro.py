@@ -1571,7 +1571,6 @@ with tabs[2]:
             else:
                 st.info("No rows match your filters.")
                 
-# -------- TAB 4: Recommended Bets (Legacy) --------
 # -------- TAB 4: Recommended Bets (Unified + Discord) --------
 with tabs[3]:
     st.subheader("🎯 Recommended Bets — Unified (SGO + OddsAPI + SportsData)")
@@ -1665,8 +1664,17 @@ with tabs[3]:
             if st.button("📢 Send Top Bets to Discord", key="send_discord_tab4"):
                 top10 = rec_df.head(10)
                 msg = format_recommended_msg(f"Top Value Picks — {today_str()}", top10, top_n=10)
-                push_recommended(top10, title="Top Value Picks")
-                st.success("✅ Sent Top 10 Picks to Discord!")
+
+                try:
+                    from props_engine_plus import send_discord, DISCORD_WEBHOOK
+
+                    if DISCORD_WEBHOOK:
+                        send_discord(msg, DISCORD_WEBHOOK)
+                        st.success("✅ Sent Top 10 Picks to Discord!")
+                    else:
+                        st.warning("⚠️ Discord webhook not found in .env file.")
+                except Exception as e:
+                    st.error(f"❌ Failed to send to Discord: {e}")
                 
 # -------- TAB 5: AI-Driven Recommended Bets (Props Engine) --------
 with tabs[4]:
