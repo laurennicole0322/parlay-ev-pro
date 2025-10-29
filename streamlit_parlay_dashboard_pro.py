@@ -1676,90 +1676,66 @@ with tabs[3]:
                 except Exception as e:
                     st.error(f"❌ Failed to send to Discord: {e}")
                 
-# -------- TAB 5: AI-Driven Recommended Bets (Auto + Smart Discord + Manual Push) --------
+# -------- TAB 5: AI-Driven Recommended Bets (Props Engine + EV + Kelly) --------
 with tabs[4]:
-    import os, time, json
-    from hashlib import md5
+    st.subheader("🤖 AI-Driven Recommended Bets (Props Engine + EV + Kelly)")
+    st.caption("Automatically scans all available props, filters for True Prob ≥ 60% and strong +EV signals.")
 
-    st.header("🤖 AI-Driven Recommended Bets (Props Engine + EV + Kelly)")
-    st.caption("Automatically scans all player props, filters by EV%, True Probability, and Kelly criteria — with auto and manual Discord posting.")
+    bankroll = st.number_input("💰 Bankroll ($)", min_value=10, max_value=10000, value=100)
 
-    # --- Configurable filters ---
-    sport_choice = st.selectbox("Choose Sport", ["NBA", "NFL", "MLB"], index=0)
-    bankroll = st.number_input("Bankroll ($)", min_value=10.0, value=100.0)
-    min_ev = st.slider("Minimum Edge %", 1, 20, 5)
-    min_trueprob = st.slider("Minimum True Probability", 0.5, 0.9, 0.6)
+    st.markdown("### 🚀 Running AI Auto-Scan Across All Available Sources...")
 
-    # --- Auto-run AI Scan ---
-    with st.spinner("🤖 Running AI scan automatically..."):
+    # --- Merge all available sources safely ---
+    sources = []
+    for df_name in ["odds_df", "sgo_df", "sdata_df"]:
+        if df_name in locals():
+            df = locals()[df_name]
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sources.append(df)
+
+    if sources:
+        all_data = pd.concat(sources, ignore_index=True, sort=False).dropna(subset=["EV_Pct"], how="any")
+    else:
+        all_data = pd.DataFrame()
+
+    if all_data.empty:
+        st.warning("⚠️ No betting data available from Odds API / SportsData / SGO.")
+    else:
         try:
-            # Merge available sources
-            all_data = pd.concat(
-                [df for df in [odds_df, sgo_df, sdata_df] if isinstance(df, pd.DataFrame) and not df.empty],
-                ignore_index=True,
-                sort=False
-            ).dropna(subset=["EV_Pct"], how="any")
+            # --- Apply filters ---
+            ai_df = all_data[
+                (all_data["EV_Pct"].fillna(0) > 5) &
+                (all_data["HalfKelly_Pct"].fillna(0) > 2) &
+                (all_data.get("AdjTrueProb", all_data["TrueProb"]).fillna(0) >= 0.60)
+            ].copy()
 
-            if all_data.empty:
-                st.warning("⚠️ No betting data available yet — try running the other tabs first.")
+            if ai_df.empty:
+                st.info("No AI bets met thresholds (EV > 5%, Half Kelly > 2%, True Prob ≥ 60%).")
             else:
-                # Apply filters
-                ai_df = all_data[
-                    (all_data["EV_Pct"].fillna(0) > min_ev) &
-                    (all_data["TrueProb"].fillna(0) >= min_trueprob)
-                ].copy()
-
-                # Rank and show
                 ai_df = ai_df.sort_values(["EV_Pct", "HalfKelly_Pct"], ascending=False)
-                st.success(f"✅ Auto-scan complete — showing top {min(25, len(ai_df))} value props.")
-                st.dataframe(ai_df.head(25), use_container_width=True, height=550)
-
-                # --- Smart Discord Posting ---
                 top10 = ai_df.head(10)
-                top10_signature = md5(top10.to_json().encode()).hexdigest()
-                last_post_file = "/mount/tmp/last_discord_post.json"
-                should_post = False
-                last_hash = ""
-                last_time = 0
 
-                if os.path.exists(last_post_file):
+                st.dataframe(top10, use_container_width=True, height=520)
+
+                # --- Export CSV ---
+                csv = ai_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download AI Recommendations (CSV)",
+                    data=csv,
+                    file_name=f"ai_recommended_bets_{today_str()}.csv",
+                    mime="text/csv",
+                    key="dl_ai_bets",
+                )
+
+                # --- Discord Push Button ---
+                st.markdown("### 🔔 Send AI Picks to Discord")
+                if st.button("📢 Push AI Top 10 to Discord", key="send_discord_ai"):
                     try:
-                        with open(last_post_file, "r") as f:
-                            data = json.load(f)
-                            last_hash = data.get("hash", "")
-                            last_time = data.get("time", 0)
-                    except Exception:
-                        pass
-
-                # Auto-post if 1h passed OR top10 changed
-                if time.time() - last_time > 3600 or top10_signature != last_hash:
-                    should_post = True
-
-                if should_post and not ai_df.empty:
-                    msg = format_recommended_msg("AI-Driven Value Picks", top10, top_n=10)
-                    push_recommended(top10, title="AI-Driven Value Picks")
-                    with open(last_post_file, "w") as f:
-                        json.dump({"hash": top10_signature, "time": time.time()}, f)
-                    st.info("📡 Auto-posted new AI-Driven Top 10 Bets to Discord.")
-                else:
-                    last_post_display = (
-                        time.strftime("%I:%M %p ET", time.localtime(last_time))
-                        if last_time else "Never"
-                    )
-                    st.caption(f"⏱ Discord auto-post skipped — no new picks or cooldown. Last post: {last_post_display}")
-
-                # --- Manual Push Option ---
-                st.markdown("---")
-                st.markdown("### 📢 Manual Discord Push")
-                st.caption("Use this to instantly send the current Top 10 AI bets to Discord, regardless of cooldown.")
-
-                if st.button("📢 Push to Discord Now", key="send_ai_discord"):
-                    try:
-                        msg = format_recommended_msg("Manual Push — AI Top 10 Value Picks", top10, top_n=10)
-                        push_recommended(top10, title="Manual AI Push")
-                        st.success("✅ Manual push sent to Discord successfully.")
+                        msg = format_recommended_msg(f"AI Top Value Picks — {today_str()}", top10, top_n=10)
+                        push_recommended(top10, title="AI Top Value Picks")
+                        st.success("✅ AI Top 10 Picks sent to Discord!")
                     except Exception as e:
-                        st.error(f"❌ Manual Discord push failed: {e}")
+                        st.error(f"❌ Failed to send to Discord: {e}")
 
         except Exception as e:
             st.error(f"❌ Error during AI auto-scan: {e}")
