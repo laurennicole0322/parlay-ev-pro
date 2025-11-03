@@ -14,6 +14,9 @@ import pytz
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Tuple, Optional, Union
 from dotenv import load_dotenv  # 👈 load environment variables
+from props_engine_plus import load_user_bet_history
+
+
 
 # --- Import AI Betting Engine ---
 from props_engine_plus import (
@@ -21,8 +24,59 @@ from props_engine_plus import (
     push_recommended,
     push_placed_bet,
     todays_matchups_mlb_probables,
-    format_recommended_msg,  # 👈 required for Discord message formatting
+    format_recommended_msg,
+    append_bet_feedback,
+    logistic_calibrate,
+    update_bet_outcomes,   # 🏁 auto-updates Outcome column
 )
+
+# --- Unified Odds + Extractors (Streamlit Cached) ---
+from unified_odds_engine_v3_1 import (
+    fetch_sgo_events,
+    fetch_oddsapi_games,
+    extract_sgo_df,
+    extract_oddsapi_df,
+    extract_sportsdataio_df,
+    quality_filter
+)
+
+# =====================================
+# 🎨 UNIVERSAL STYLE HELPERS (EV/Kelly)
+# =====================================
+import pandas as pd
+
+def color_row(row):
+    """Full-row color highlight based on EV% value."""
+    ev = row.get("EV_Pct", 0)
+    if pd.isna(ev):
+        return [""] * len(row)
+    if ev >= 5:
+        color = "#166534"   # strong green
+    elif ev >= 2:
+        color = "#22c55e"   # moderate green
+    elif ev > 0:
+        color = "#eab308"   # yellow
+    else:
+        color = "#b91c1c"   # red
+    return [f"background-color: {color}; color: white;"] * len(row)
+
+def style_table(df: pd.DataFrame):
+    """Apply row highlighting and percent formatting safely."""
+    try:
+        return (
+            df.style
+            .apply(color_row, axis=1)
+            .format({
+                "EV_Pct": "{:.2f}%",
+                "Kelly_Pct": "{:.2f}%",
+                "HalfKelly_Pct": "{:.2f}%",
+                "ImpliedProb": "{:.2%}",
+                "TrueProb": "{:.2%}",
+            })
+        )
+    except Exception as e:
+        print(f"[WARN] style_table failed: {e}")
+        return df
 
 # --- Load environment variables (API keys, Discord webhooks, etc.) ---
 load_dotenv()  # 👈 loads .env file automatically
@@ -43,7 +97,6 @@ else:
 st.set_page_config(page_title="Parlay +EV Pro", layout="wide")
 
 # ============== Helpers ==============
-
 def us_to_prob(american_odds: Optional[str]) -> Optional[float]:
     """Convert American odds to implied probability (0..1)."""
     if american_odds is None:
@@ -79,6 +132,96 @@ def safe_get(d: dict, *keys, default=None):
         cur = cur.get(k)
     return cur if cur is not None else default
 
+
+# ============================================================
+# 🔍 Check SportsGameOdds API Usage
+# ============================================================
+def check_sgo_usage(api_key: str):
+    """
+    Fetches and displays your current SportsGameOdds usage limits.
+    Warns if you're near or past your monthly or per-minute caps.
+    """
+    try:
+        url = f"https://api.sportsgameodds.com/v2/account/usage?apiKey={api_key}"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        tier = data.get("tier", "Unknown")
+        rate = data.get("ratelimits", {})
+
+        per_min = rate.get("per-minute", {})
+        per_day = rate.get("per-day", {})
+        per_month = rate.get("per-month", {})
+
+        min_used = per_min.get("current-requests", 0)
+        min_limit = per_min.get("max-requests", 0)
+
+        day_used = per_day.get("current-requests", 0)
+        day_limit = per_day.get("max-requests", 0)
+
+        month_used = per_month.get("current-entities", 0)
+        month_limit = per_month.get("max-entities", 0)
+
+        st.markdown(f"### ⚙️ SportsGameOdds API Usage — *{tier.title()}* tier")
+        st.write(f"**Per Minute:** {min_used} / {min_limit}")
+        st.write(f"**Per Day:** {day_used} / {day_limit}")
+        st.write(f"**Per Month (Entities):** {month_used:,} / {month_limit:,}")
+
+        # Highlight warnings visually
+        if month_limit and month_used >= month_limit:
+            st.error("🚫 You’ve reached your **monthly entity limit** — SGO requests will fail until reset.")
+        elif month_limit and month_used >= 0.9 * month_limit:
+            st.warning("⚠️ You’re using over **90%** of your monthly SGO limit. Consider upgrading or throttling refreshes.")
+        elif min_limit != "unlimited" and min_used >= min_limit:
+            st.warning("⏱ You’ve hit your **per-minute rate limit** — wait 60 seconds before retrying.")
+        else:
+            st.success("✅ SGO usage within limits.")
+        return data
+    except Exception as e:
+        st.warning(f"Could not check SGO usage: {e}")
+        return None
+    
+# ============================================================
+# 🎯 PERSONALIZATION HELPER (Recalibrate Odds Using User Bets)
+# ============================================================
+def apply_personalization(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Adjust TrueProb, EV%, and Edge% based on the user's historical betting preferences
+    (from my_bet_history.xlsx). Adds personalized columns to the dataframe.
+    """
+
+    try:
+        from props_engine_plus import load_user_bet_history
+        user_bets = load_user_bet_history(verbose=False)
+
+        if user_bets.empty:
+            if verbose:
+                print("ℹ️ No personal bet history found — skipping personalization.")
+            return df
+
+        # --- Calculate user preferences ---
+        league_pref = user_bets["League"].value_counts(normalize=True).to_dict()
+        market_pref = user_bets["Market"].value_counts(normalize=True).to_dict()
+
+        # --- Apply bias weighting ---
+        def bias_row(row):
+            league_weight = league_pref.get(row.get("League"), 0.05)
+            market_weight = market_pref.get(row.get("MarketType", row.get("Market")), 0.05)
+            bias_factor = 1 + ((league_weight + market_weight) / 3)
+            return min(row.get("TrueProb", 0) * bias_factor, 1.0)
+
+        df["PersonalizedProb"] = df.apply(bias_row, axis=1)
+        df["PersonalizedEdge%"] = (df["PersonalizedProb"] - df["ImpliedProb"]) * 100
+        df["PersonalizedEV%"] = ((df["PersonalizedProb"] * df["BookOdds"]) - 1) * 100
+
+        if verbose:
+            print(f"✅ Personalized recalibration applied to {len(df)} rows.")
+        return df
+
+    except Exception as e:
+        print(f"⚠️ Personalization failed: {e}")
+        return df
+    
 # ============== Finalize DataFrame Helper ==============
 def finalize_odds_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """
@@ -172,6 +315,53 @@ def kelly_fraction(p_true: float, odds_decimal: float) -> float:
     f = ((b * p_true) - q) / b
     return max(f, 0)
 
+
+
+# --- Optional Auto-Refresh every 5 minutes ---
+import time, json
+from datetime import datetime
+
+st.divider()
+
+AUTO_REFRESH = st.sidebar.checkbox("⏱ Auto-refresh engine every 5 minutes", value=False)
+HISTORY_PATH = "data/parlay_history.csv"
+
+def get_last_parlay_signature():
+    """Get a unique signature from the latest parlay in history (legs only)."""
+    if not os.path.exists(HISTORY_PATH):
+        return None
+    df = pd.read_csv(HISTORY_PATH)
+    if df.empty or "Legs" not in df.columns:
+        return None
+    return str(df.iloc[-1]["Legs"]).strip()
+
+if AUTO_REFRESH:
+    st.info("Auto-refresh is active. The engine will run every 5 minutes and post only if a *new* parlay is detected.")
+    prev_signature = get_last_parlay_signature()
+    last_run = st.empty()
+
+    while True:
+        res = subprocess.run(
+            ["python3", "refresh_live_odds.py"],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        if res.stdout:
+            st.code(res.stdout)
+            new_signature = get_last_parlay_signature()
+            if new_signature and new_signature != prev_signature:
+                st.success("🚀 New parlay detected and posted to Discord!")
+                prev_signature = new_signature
+            else:
+                st.info("No new parlay found this cycle — skipping Discord post.")
+        else:
+            st.warning("(no output from refresh script)")
+
+        last_run.caption(f"🕒 Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        time.sleep(300)  # 5 minutes
+        
 # ============== Sidebar ==============
 
 st.sidebar.title("🔑 API Keys & Settings")
@@ -186,7 +376,7 @@ st.sidebar.markdown("---")
 sport = st.sidebar.selectbox(
     "Sport / League",
     [
-        "NBA", "NFL", "MLB", "NCAAF",
+        "NBA", "NFL", "NHL", "MLB", "NCAAF",
         "Soccer - EPL",
         "Soccer - La Liga",
         "Soccer - Serie A",
@@ -221,291 +411,47 @@ st.sidebar.markdown("---")
 
 run_btn = st.sidebar.button("🚀 Run Dashboard", type="primary", key="run_button")
 
+# ==========================================================
+# Unified Sports Map (for OddsAPI, SportsData.io, and SGO)
+# ==========================================================
+sport_map_odds = {
+    # 🏀 Basketball
+    "NBA": "basketball_nba",
+    "NCAAB": "basketball_ncaab",
 
-# ============== Data Fetchers ==============
-# Optional: simple SportsData.io props pull (only for NBA/NFL, by date)
-@st.cache_data(ttl=120)
-def fetch_sportsdataio_props(key: str, sport: str, the_date: str) -> pd.DataFrame:
-    """
-    Minimal props feed:
-      - NBA: /v3/nba/odds/json/PlayerPropsByDate/{date}
-      - NFL: /v3/nfl/odds/json/PlayerPropsByDate/{date}
-    Returns empty if key missing or unsupported sport.
-    """
-    if not key:
-        return pd.DataFrame()
+    # 🏈 Football
+    "NFL": "americanfootball_nfl",
+    "NCAAF": "americanfootball_ncaaf",
 
-    sport_lower = sport.lower()
-    if sport_lower not in ("nba", "nfl"):
-        return pd.DataFrame()
+    # ⚾ Baseball
+    "MLB": "baseball_mlb",
 
-    base = f"https://api.sportsdata.io/v3/{sport_lower}/odds/json/PlayerPropsByDate/{the_date}"
-    params = {"key": key}
-    try:
-        r = requests.get(base, params=params, timeout=25)
-        if r.status_code != 200:
-            st.warning(f"SportsData.io {r.status_code}: {r.text[:200]}")
-            return pd.DataFrame()
-        data = r.json()
-    except Exception as e:
-        st.error(f"SportsData.io error: {e}")
-        return pd.DataFrame()
+    # 🏒 Hockey
+    "NHL": "icehockey_nhl",  # ✅ Added NHL support
 
-    rows = []
-    for p in data or []:
-        rows.append(dict(
-            Date=the_date,
-            Team=p.get("Team"),
-            Player=p.get("PlayerName"),
-            Market=p.get("BetType"),
-            StatLine=p.get("PlayerPropTotal"),
-            Book=p.get("Sportsbook"),
-            OddsAmerican=p.get("PayoutAmerican"),
-            ImpliedProb=us_to_prob(p.get("PayoutAmerican")) if p.get("PayoutAmerican") else None,
-            Game=p.get("GameDisplay") or f"{p.get('AwayTeam')} @ {p.get('HomeTeam')}"
-        ))
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["ImpliedProb"] = pd.to_numeric(df["ImpliedProb"], errors="coerce")
-    return df
+    # ⚽ Soccer
+    "Soccer - EPL": "soccer_epl",
+    "Soccer - La Liga": "soccer_spain_la_liga",
+    "Soccer - Serie A": "soccer_italy_serie_a",
+    "Soccer - Bundesliga": "soccer_germany_bundesliga",
+    "Soccer - Ligue 1": "soccer_france_ligue_one",
+    "Soccer - MLS": "soccer_usa_mls",
+    "Soccer - UEFA Champions League": "soccer_uefa_champions_league",
+    "Soccer - UEFA Europa League": "soccer_uefa_europa_league",
+    "Soccer - World Cup": "soccer_fifa_world_cup",
+}
 
-# ==========================================
-# 🧠 ODDS API FETCHER + EXTRACTOR (FINAL)
-# ==========================================
-# --- Clean Odds API Fetcher (v4, no debug) ---
-@st.cache_data(ttl=60)
-def fetch_the_odds_api_games(
-    odds_api_key: str,
-    sport_key: str,
-    regions: str = "us",
-    markets: str = "h2h,spreads,totals",
-) -> list:
-    """
-    Fetch game lines (Moneyline, Spreads, Totals) from The Odds API v4.
-    Returns the raw JSON (list of events). No Streamlit prints.
-    """
-    if not odds_api_key:
-        return []
-
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": odds_api_key,
-        "regions": regions,
-        "markets": markets,
-        "oddsFormat": "american",
-        "dateFormat": "iso",
-    }
-
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            st.warning(f"The Odds API {r.status_code}: {r.text[:200]}")
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        st.error(f"The Odds API error: {e}")
-        return []
+# Get the selected sport key dynamically
+sport_key = sport_map_odds.get(sport, "icehockey_nhl")
 
 
-# --- Odds API Extractor (Moneyline, Spreads, Totals) ---
-def extract_odds_api_df(raw_data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> pd.DataFrame:
-    """
-    Normalize The Odds API v4 output into a unified DataFrame.
-    Handles Moneyline (h2h), Spreads, and Totals (Over/Under).
-    Adds ImpliedProb, EV%, Kelly%, and Half-Kelly calculations.
-    """
-    if not raw_data:
-        return pd.DataFrame()
 
-    events = raw_data if isinstance(raw_data, list) else [raw_data]
-    rows: List[Dict[str, Any]] = []
-
-    for ev in events:
-        sport_title = ev.get("sport_title", "")
-        event_id = ev.get("id", "")
-        commence = ev.get("commence_time")
-        home_team = ev.get("home_team", "")
-        teams = ev.get("teams") or []
-        game_name = " @ ".join(teams) if teams else home_team
-
-        for bk in ev.get("bookmakers", []) or []:
-            book = bk.get("title", "")
-
-            for mk in bk.get("markets", []) or []:
-                mkey = mk.get("key", "")
-                outcomes = mk.get("outcomes", []) or []
-
-                # --- MONEYLINE ---
-                if mkey == "h2h":
-                    for o in outcomes:
-                        side = o.get("name", "")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Commence=commence,
-                            Game=game_name,
-                            MarketType="moneyline",
-                            MarketName="moneyline",
-                            Side=side,
-                            Line=None,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly / 2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly / 2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                        ))
-
-                # --- SPREADS ---
-                elif mkey == "spreads":
-                    for o in outcomes:
-                        side = o.get("name", "")
-                        point = o.get("point")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        try:
-                            side_label = f"{side} {float(point):+g}" if point is not None else side
-                        except Exception:
-                            side_label = side
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Commence=commence,
-                            Game=game_name,
-                            MarketType="spread",
-                            MarketName="spread",
-                            Side=side_label,
-                            Line=point,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly / 2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly / 2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                        ))
-
-                # --- TOTALS (OVER/UNDER) ---
-                elif mkey == "totals":
-                    for o in outcomes:
-                        side = o.get("name", "")
-                        point = o.get("point")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        try:
-                            side_label = f"{side} {float(point):g}" if point is not None else side
-                        except Exception:
-                            side_label = side
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Commence=commence,
-                            Game=game_name,
-                            MarketType="total_points",
-                            MarketName="total_points",
-                            Side=side_label,
-                            Line=point,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly / 2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly / 2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                        ))
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Cleanup / Sort
-    df["Commence"] = pd.to_datetime(df["Commence"], errors="coerce")
-    df = df.sort_values(["Commence", "Game", "MarketType", "Side"], ignore_index=True)
-
-    # Add formatted %
-    df["ImpliedProb%"] = df["ImpliedProb"].apply(fmt_pct)
-    df["TrueProb%"] = df["TrueProb"].apply(fmt_pct)
-    df["Edge%"] = df["EdgePct"].map(lambda x: f"{x:0.2f}%" if pd.notna(x) else "")
-
-    # Order columns for dashboard
-    ordered_cols = [
-        "League", "EventID", "Commence", "Game",
-        "MarketType", "MarketName", "Side", "Line",
-        "BookOdds", "TrueOdds", "ImpliedProb%", "TrueProb%",
-        "EV_Pct", "Kelly_Pct", "HalfKelly_Pct", "HalfKellyCapped_Pct",
-        "BooksAvailable"
-    ]
-    extras = [c for c in df.columns if c not in ordered_cols]
-    return df[[c for c in ordered_cols if c in df.columns] + extras]
-
-# ==========================================
-# 🎯 SPORTS GAME ODDS (SGO) FETCHER (FINAL)
-# ==========================================
-@st.cache_data(ttl=60)
-def fetch_sgo_events(sgo_api_key: str, league_id: str, limit: int = 50) -> Dict[str, Any]:
-    """
-    Pull full market data from SportsGameOdds v2/events endpoint.
-    Returns JSON payload for use with extract_sgo_df().
-    """
-    if not sgo_api_key:
-        return {}
-
-    params = {
-        "apiKey": sgo_api_key,
-        "oddsAvailable": "true",
-        "leagueID": league_id,
-        "limit": limit,
-        "includeAltLines": "true",
-        "includeOpposingOdds": "true",
-        "include": "players,teams,markets,odds",  # ✅ full context for parsing
-    }
-
-    url = "https://api.sportsgameodds.com/v2/events?"
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code != 200:
-            try:
-                body = r.json()
-                st.warning(f"SGO {r.status_code}: {body.get('error') or str(body)[:200]}")
-            except Exception:
-                st.warning(f"SGO {r.status_code}: {r.text[:200]}")
-            return {}
-        return r.json()
-    except Exception as e:
-        st.error(f"SGO error: {e}")
-        return {}
-
+# ===================================================
+# 🧠 NORMALIZATION HELPERS (used by extractors)
+# ===================================================
 def normalize_market_name(market_key: str, market_name: str) -> str:
     """
-    Convert raw market names/keys into friendly categories (e.g., 'Player Points O/U').
-    This helps with filtering and grouping in the Streamlit dashboard.
+    Convert raw market names/keys into readable labels (e.g., 'Player Points Over').
     """
     key = (market_key or "").lower()
     name = (market_name or "").lower()
@@ -513,8 +459,6 @@ def normalize_market_name(market_key: str, market_name: str) -> str:
     def contains(*words):
         return all(w in key or w in name for w in words)
 
-
-    # ----- Explicit Over / Under detection -----
     if "over" in key or "over" in name:
         if "points" in key or "points" in name:
             return "Player Points Over"
@@ -551,13 +495,11 @@ def normalize_market_name(market_key: str, market_name: str) -> str:
         if "receiving yards" in name or contains("receiving", "yards"):
             return "Receiving Yards Under"
 
-    # Default: return readable fallback
     return market_name or market_key
+
+
 def choose_line(odd_obj: Dict[str, Any]) -> Optional[float]:
-    """
-    Pick the best available numeric line (O/U or spread) for display.
-    Priority order: bookOverUnder → bookSpread → fairOverUnder → fairSpread
-    """
+    """Select the most relevant numeric line (O/U or spread)."""
     for k in ("bookOverUnder", "bookSpread", "fairOverUnder", "fairSpread"):
         v = odd_obj.get(k)
         if v is None:
@@ -570,9 +512,7 @@ def choose_line(odd_obj: Dict[str, Any]) -> Optional[float]:
 
 
 def choose_odds(odd_obj: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Return (bookOdds, fairOdds) as normalized strings like '+120' or '-130'.
-    """
+    """Return (bookOdds, fairOdds) as normalized strings like '+120' or '-130'."""
     bo = odd_obj.get("bookOdds")
     fo = odd_obj.get("fairOdds")
 
@@ -879,516 +819,6 @@ def adjust_true_probability(row, injuries_df):
     prob = max(0, min(prob, 1.0))
     return prob
 
-# ============================================
-# 🧠 UNIFIED ENHANCED EXTRACTORS (v3.1) — Over / Under / Yes / No support
-# ============================================
-def extract_sgo_df(payload: Dict[str, Any], wanted_books: List[str]) -> pd.DataFrame:
-    """
-    Flatten SportsGameOdds (SGO) events JSON into a DataFrame.
-    Ensures Over, Under, Yes, and No sides are all captured and normalized.
-    Adds implied vs true probability columns and betting metrics.
-    """
-    if not payload or not payload.get("success"):
-        return pd.DataFrame()
-
-    events = payload.get("data") or []
-    rows: List[Dict[str, Any]] = []
-
-    for ev in events:
-        event_id = ev.get("eventID")
-        league_id = ev.get("leagueID")
-
-        teams = safe_get(ev, "teams") or {}
-        away = safe_get(teams, "away", "names", "long", default="Away")
-        home = safe_get(teams, "home", "names", "long", default="Home")
-        game_name = f"{away} @ {home}"
-
-        players_map = safe_get(ev, "players") or {}
-        odds = ev.get("odds") or {}
-
-        # --- Merge similar markets (Over/Under, Yes/No) ---
-        merged_odds = {}
-        for k, v in odds.items():
-            base_key = (
-                k.replace("_ou_over", "over")
-                 .replace("_ou_under", "under")
-                 .replace("-ou-over", "-ou")
-                 .replace("-ou-under", "-ou")
-                 .replace("_yes", "_yn")
-                 .replace("_no", "_yn")
-                 .replace("-yes", "-yn")
-                 .replace("-no", "-yn")
-            )
-            merged_odds.setdefault(base_key, []).append((k, v))
-
-        for base_key, variants in merged_odds.items():
-            for oddID, odd_obj in variants:
-                market_name = odd_obj.get("marketName", oddID)
-                market_type = normalize_market_name(oddID, market_name)
-
-                # --- Detect Side (Over/Under/Yes/No) ---
-                id_lower = oddID.lower()
-                name_lower = market_name.lower()
-                if "over" in id_lower or "o" in name_lower:
-                    side_label = "Over"
-                elif "under" in id_lower or "u" in name_lower:
-                    side_label = "Under"
-                elif "yes" in id_lower or "yes" in name_lower:
-                    side_label = "Yes"
-                elif "no" in id_lower or "no" in name_lower:
-                    side_label = "No"
-                else:
-                    # fallback to helper
-                    side_label = determine_side_label(
-                        oddID=oddID,
-                        market_name=market_name,
-                        book_line=odd_obj.get("point"),
-                        odd_obj=odd_obj,
-                        home=home,
-                        away=away
-                    )
-
-                # --- Player / entity info ---
-                stat_entity = odd_obj.get("statEntityID")
-                player_id = odd_obj.get("playerID") or (
-                    stat_entity if stat_entity not in ("home", "away", "all") else None
-                )
-                player_name = (
-                    safe_get(players_map, player_id, "name", default=player_id)
-                    if player_id in players_map else None
-                )
-
-                # --- Filter for wanted bookmakers ---
-                bybk = odd_obj.get("byBookmaker") or {}
-                chosen = {
-                    bk: val for bk, val in bybk.items()
-                    if (not wanted_books or bk in wanted_books) and isinstance(val, dict)
-                }
-                if not chosen:
-                    continue
-
-                # --- Extract price & line ---
-                book_line = choose_line(odd_obj)
-                book_odds_str, fair_odds_str = choose_odds(odd_obj)
-
-                # --- Calculate metrics ---
-                implied_prob = implied_probability(book_odds_str)
-                true_prob = implied_probability(fair_odds_str)
-                edge_pct = ((true_prob - implied_prob) * 100.0) if (true_prob and implied_prob) else None
-                dec = american_to_decimal(book_odds_str)
-                ev_pct = (((true_prob * dec) - 1) * 100.0) if (true_prob and dec) else None
-                kelly = (kelly_fraction(true_prob, dec) * 100.0) if (true_prob and dec) else None
-                half_kelly = (kelly / 2.0) if kelly is not None else None
-                half_kelly_capped = min(half_kelly, 10.0) if half_kelly is not None else None
-
-                rows.append(dict(
-                    League=league_id,
-                    EventID=event_id,
-                    Game=game_name,
-                    Player=player_name,
-                    PlayerID=player_id,
-                    MarketType=market_type,
-                    MarketName=market_name,
-                    Side=side_label,  # ✅ Over / Under / Yes / No
-                    Line=book_line,
-                    BookOdds=book_odds_str,
-                    TrueOdds=fair_odds_str,
-                    ImpliedProb=implied_prob,
-                    TrueProb=true_prob,
-                    EdgePct=edge_pct,
-                    EV_Pct=ev_pct,
-                    Kelly_Pct=kelly,
-                    HalfKelly_Pct=half_kelly,
-                    HalfKellyCapped_Pct=half_kelly_capped,
-                    BooksAvailable=",".join(sorted(chosen.keys())) if chosen else ""
-                ))
-
-    return finalize_odds_df(rows)
-
-# ============== Enhanced extract_odds_api_df (clean + O/U grouping) ==============
-from typing import Union
-
-def extract_odds_api_df(raw_data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> pd.DataFrame:
-    """
-    Normalize The Odds API v4 output into a unified DataFrame.
-    Handles Moneyline (h2h), Spreads, and Totals (Over/Under) explicitly.
-    Adds ImpliedProb, EV%, Kelly%, plus formatted % columns.
-    """
-    if not raw_data:
-        return pd.DataFrame()
-
-    events = raw_data if isinstance(raw_data, list) else [raw_data]
-    rows: List[Dict[str, Any]] = []
-
-    for ev in events:
-        sport_title = ev.get("sport_title", "")
-        event_id = ev.get("id", "")
-        commence = ev.get("commence_time")
-        home_team = ev.get("home_team", "")
-        teams = ev.get("teams") or []
-        game_name = " @ ".join(teams) if teams else home_team
-
-        for bk in ev.get("bookmakers", []) or []:
-            book = bk.get("title", "")
-
-            for mk in bk.get("markets", []) or []:
-                mkey = mk.get("key", "")  # 'h2h', 'spreads', 'totals'
-                outcomes = mk.get("outcomes", []) or []
-
-                if mkey == "h2h":
-                    # Moneyline: two teams, name==team, no point
-                    for o in outcomes:
-                        side = o.get("name", "")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Game=game_name,
-                            Player=None,
-                            PlayerID=None,
-                            MarketType="moneyline",
-                            MarketName="moneyline",
-                            Side=side,
-                            Line=None,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly/2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly/2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                            Commence=commence,
-                        ))
-
-                elif mkey == "spreads":
-                    for o in outcomes:
-                        side = o.get("name", "")
-                        point = o.get("point")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        # Label as "<Team> -X.X" or "<Team> +X.X"
-                        try:
-                            spread_lbl = f"{side} {float(point):+g}" if point is not None else side
-                        except Exception:
-                            spread_lbl = side
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Game=game_name,
-                            Player=None,
-                            PlayerID=None,
-                            MarketType="spread",
-                            MarketName="spread",
-                            Side=spread_lbl,
-                            Line=point,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly/2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly/2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                            Commence=commence,
-                        ))
-
-                elif mkey == "totals":
-                    # Over/Under
-                    for o in outcomes:
-                        side_raw = o.get("name", "")  # "Over" / "Under"
-                        point = o.get("point")
-                        odds_str = str(o.get("price")) if o.get("price") is not None else None
-                        implied = us_to_prob(odds_str)
-                        dec = american_to_decimal(odds_str)
-                        ev_pct = (((implied * dec) - 1) * 100.0) if (implied and dec) else None
-                        kelly = (kelly_fraction(implied, dec) * 100.0) if (implied and dec) else None
-
-                        # Side label: "Over 223.5" / "Under 223.5"
-                        try:
-                            side_lbl = f"{side_raw} {float(point):g}" if point is not None else side_raw
-                        except Exception:
-                            side_lbl = side_raw
-
-                        rows.append(dict(
-                            League=sport_title,
-                            EventID=event_id,
-                            Game=game_name,
-                            Player=None,
-                            PlayerID=None,
-                            MarketType="total_points",
-                            MarketName="total_points",
-                            Side=side_lbl,
-                            Line=point,
-                            BookOdds=odds_str,
-                            TrueOdds=None,
-                            ImpliedProb=implied,
-                            TrueProb=implied,
-                            EdgePct=0.0,
-                            EV_Pct=ev_pct,
-                            Kelly_Pct=kelly,
-                            HalfKelly_Pct=(kelly/2.0) if kelly is not None else None,
-                            HalfKellyCapped_Pct=min(kelly/2.0, 10.0) if kelly is not None else None,
-                            BooksAvailable=book,
-                            Commence=commence,
-                        ))
-                else:
-                    # Ignore other markets (e.g., player-level props) since your call doesn't request them
-                    continue
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Dtypes + pretty %
-    for c in ["Line", "ImpliedProb", "TrueProb", "EdgePct", "EV_Pct", "Kelly_Pct", "HalfKelly_Pct", "HalfKellyCapped_Pct"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["ImpliedProb%"] = df["ImpliedProb"].apply(fmt_pct)
-    df["TrueProb%"]    = df["TrueProb"].apply(fmt_pct)
-    df["Edge%"]        = df["EdgePct"].map(lambda x: f"{x:0.2f}%" if pd.notna(x) else "")
-
-    df["Commence"] = pd.to_datetime(df["Commence"], errors="coerce")
-    df = df.sort_values(["Commence", "Game", "MarketType", "Side"], ignore_index=True)
-
-    ordered_cols = [
-        "League", "EventID", "Commence", "Game",
-        "MarketType", "MarketName", "Side", "Line",
-        "BookOdds", "TrueOdds",
-        "EV_Pct", "Kelly_Pct", "HalfKelly_Pct", "HalfKellyCapped_Pct",
-        "BooksAvailable", "ImpliedProb%", "TrueProb%", "Edge%"
-    ]
-    extras = [c for c in df.columns if c not in ordered_cols]
-    return df[[c for c in ordered_cols if c in df.columns] + extras]
-
-def extract_sportsdataio_df(raw_data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> pd.DataFrame:
-    """
-    Normalize SportsData.io props into the unified format.
-    Handles Over/Under inference, implied probabilities, and Kelly metrics.
-    """
-    if not raw_data:
-        return pd.DataFrame()
-
-    rows: List[Dict[str, Any]] = []
-
-    # Always treat as list
-    for p in (raw_data if isinstance(raw_data, list) else [raw_data]):
-        game = p.get("GameDisplay") or f"{p.get('AwayTeam')} @ {p.get('HomeTeam')}"
-        player = p.get("PlayerName")
-        team = p.get("Team")
-        market = p.get("BetType") or ""
-        stat_line = p.get("PlayerPropTotal")
-        odds = p.get("PayoutAmerican")
-        book = p.get("Sportsbook")
-
-        # --- Infer Side ---
-        # Try to read explicit side, or derive from text
-        market_lower = market.lower()
-        if "over" in market_lower:
-            side_label = f"Over {stat_line}" if stat_line else "Over"
-        elif "under" in market_lower:
-            side_label = f"Under {stat_line}" if stat_line else "Under"
-        else:
-            # default to “Both” (some props come as combined market)
-            side_label = determine_side_label(market, market, stat_line, p, p.get("HomeTeam"), p.get("AwayTeam"))
-
-        # --- Compute metrics ---
-        implied_prob = us_to_prob(odds)
-        true_prob = implied_prob
-        dec = american_to_decimal(odds)
-        ev_pct = (((true_prob * dec) - 1) * 100.0) if (true_prob and dec) else None
-        kelly = (kelly_fraction(true_prob, dec) * 100.0) if (true_prob and dec) else None
-        half_kelly = (kelly / 2.0) if kelly is not None else None
-        half_kelly_capped = min(half_kelly, 10.0) if half_kelly is not None else None
-
-        rows.append(dict(
-            League=p.get("League") or "",
-            EventID=p.get("EventID") or "",
-            Game=game,
-            Player=player,
-            PlayerID=None,
-            MarketType=market,
-            MarketName=market,
-            Side=side_label,
-            Line=stat_line,
-            BookOdds=odds,
-            TrueOdds=None,
-            ImpliedProb=implied_prob,
-            TrueProb=true_prob,
-            EV_Pct=ev_pct,
-            Kelly_Pct=kelly,
-            HalfKelly_Pct=half_kelly,
-            HalfKellyCapped_Pct=half_kelly_capped,
-            BooksAvailable=book
-        ))
-
-    return finalize_odds_df(rows)
-
-# ============================================
-# 🔍 Helper functions shared by all extractors
-# ============================================
-def determine_side_label(oddID, market_name, book_line, odd_obj, home, away) -> str:
-    """
-    Universal side-label detector for SportsGameOdds + Odds API.
-    Combines explicit pattern detection with intelligent fallbacks.
-    Covers:
-      - Over/Under (Game, Team, Player)
-      - Spread & Moneyline
-      - Player props (Points, Assists, Rebounds, Steals, 3PT, Touchdowns, etc.)
-      - Generic player stats (e.g., Hits, Strikeouts, Tackles)
-      - Yes/No and Team Totals
-    Works across NBA, NCAAB, WNBA, NFL, NCAAF, MLB, etc.
-    """
-    id_lower = str(oddID or "").lower()
-    name_lower = str(market_name or "").lower()
-    combined = f"{id_lower} {name_lower}"
-
-    # ------------------------------------------------
-    # 🟢 OVER / UNDER MARKETS (explicit)
-    # ------------------------------------------------
-    if any(x in combined for x in [
-        # Game totals
-        "points-all-game-ou-over", "points_all_game_ou_over",
-        # Team totals
-        "points-home-game-ou-over", "points-away-game-ou-over",
-        "points_home_game_ou_over", "points_away_game_ou_over",
-        # Player props (NBA/NFL)
-        "points-any_player_id-game-ou-over",
-        "assists-any_player_id-game-ou-over",
-        "rebounds-any_player_id-game-ou-over",
-        "steals-any_player_id-game-ou-over",
-        "three_pointers-made-any_player_id-game-ou-over",
-        "threepointers-made-any_player_id-game-ou-over",
-        "touchdowns-any_player_id-game-ou-over",
-        "rushing_touchdowns-any_player_id-game-ou-over",
-        "points_any_player_id_game_ou_over",
-        "assists_any_player_id_game_ou_over",
-        "rebounds_any_player_id_game_ou_over",
-        "steals_any_player_id_game_ou_over",
-        "three_pointers_made_any_player_id_game_ou_over",
-        "touchdowns_any_player_id_game_ou_over",
-        "rushing_touchdowns_any_player_id_game_ou_over",
-        # Generic
-        "ou-over", " o/u over", " over", "over:"
-    ]):
-        return f"Over {book_line}" if book_line not in (None, "", "None") else "Over"
-
-    if any(x in combined for x in [
-        # Game totals
-        "points-all-game-ou-under", "points_all_game_ou_under",
-        # Team totals
-        "points-home-game-ou-under", "points-away-game-ou-under",
-        "points_home_game_ou_under", "points_away_game_ou_under",
-        # Player props (NBA/NFL)
-        "points-any_player_id-game-ou-under",
-        "assists-any_player_id-game-ou-under",
-        "rebounds-any_player_id-game-ou-under",
-        "steals-any_player_id-game-ou-under",
-        "three_pointers-made-any_player_id-game-ou-under",
-        "threepointers-made-any_player_id-game-ou-under",
-        "touchdowns-any_player_id-game-ou-under",
-        "rushing_touchdowns-any_player_id-game-ou-under",
-        "points_any_player_id_game_ou_under",
-        "assists_any_player_id_game_ou_under",
-        "rebounds_any_player_id_game_ou_under",
-        "steals_any_player_id_game_ou_under",
-        "three_pointers_made_any_player_id_game_ou_under",
-        "touchdowns_any_player_id_game_ou_under",
-        "rushing_touchdowns_any_player_id_game_ou_under",
-        # Generic
-        "ou-under", " o/u under", " under", "under:"
-    ]):
-        return f"Under {book_line}" if book_line not in (None, "", "None") else "Under"
-
-    # ------------------------------------------------
-    # 🟠 FALLBACK FOR STRUCTURED "O/U" BUT NO SIDE WORD
-    # ------------------------------------------------
-    if ("over/under" in combined or " o/u " in combined) and not any(x in combined for x in ["over", "under"]):
-        return f"Over {book_line or ''}".strip()
-
-    # ------------------------------------------------
-    # 🟣 SPREAD MARKETS
-    # ------------------------------------------------
-    if any(x in combined for x in ["points-home-game-sp-home", "points_home_game_sp_home"]):
-        return f"{home} Spread {book_line}" if book_line else f"{home} Spread"
-
-    if any(x in combined for x in ["points-away-game-sp-away", "points_away_game_sp_away"]):
-        return f"{away} Spread {book_line}" if book_line else f"{away} Spread"
-
-    # ------------------------------------------------
-    # 🔵 MONEYLINE MARKETS
-    # ------------------------------------------------
-    if any(x in combined for x in ["points-home-game-ml-home", "points_home_game_ml_home"]):
-        return f"{home} ML"
-    if any(x in combined for x in ["points-away-game-ml-away", "points_away_game_ml_away"]):
-        return f"{away} ML"
-
-    if "moneyline" in combined or combined.strip().endswith(" ml"):
-        side_id = (odd_obj or {}).get("sideID", "").lower() if odd_obj else ""
-        if "home" in combined or side_id == "home":
-            return home
-        if "away" in combined or side_id == "away":
-            return away
-        return "Moneyline"
-
-    # ------------------------------------------------
-    # 🟡 YES / NO MARKETS
-    # ------------------------------------------------
-    if any(x in combined for x in [" yes", "will score", "first touchdown", "to score", "made", "converted", "achieve"]):
-        return "Yes"
-    if any(x in combined for x in [" no", "will not", "not score", "missed", "failed"]):
-        return "No"
-
-    # ------------------------------------------------
-    # 🟤 TEAM TOTALS
-    # ------------------------------------------------
-    if "team total" in combined or "team points" in combined:
-        if "home" in combined:
-            return f"{home} Team Total"
-        if "away" in combined:
-            return f"{away} Team Total"
-        return "Team Total"
-
-    # ------------------------------------------------
-    # ⚫ GENERAL PLAYER PROP DETECTION (fallbacks)
-    # ------------------------------------------------
-    for label, key in [
-        ("Strikeouts", "strikeouts"),
-        ("Hits", "hits"),
-        ("RBIs", "rbi"),
-        ("Home Run", "home run"),
-        ("Passing Yards", "passing yards"),
-        ("Receiving Yards", "receiving yards"),
-        ("Rushing Yards", "rushing yards"),
-        ("Assists", "assists"),
-        ("Points", "points"),
-        ("Rebounds", "rebounds"),
-        ("3PT", "3pt"),
-        ("Three Pointers", "three pointers"),
-        ("Tackles", "tackles"),
-        ("Interceptions", "interceptions"),
-    ]:
-        if key in combined:
-            return f"{label} {book_line}" if book_line not in (None, "", "None") else label
-
-    # ------------------------------------------------
-    # 🧩 DEFAULT CATCH-ALL
-    # ------------------------------------------------
-    return "Unknown"
 
 # ============== Layout / Tabs ==============
 st.title("📊 Parlay +EV Pro")
@@ -1404,184 +834,335 @@ tabs = st.tabs([
     "📈 Game Lines (The Odds API)",
     "🎯 SportsgameOdds (Player Props + Markets)",
     "🎯 Recommended Bets",
-    "AI-Driven Bets"
+    "AI-Driven Bets",
+    "⚙️ Engine & Discord"
 ])
+
 
 ## -------- TAB 1: Player Props (SportsData.io) --------
 with tabs[0]:
-    st.subheader("Player Props — SportsData.io")
-    st.caption("Works best for NBA/NFL. Enter your SportsData.io key to enable.")
+    st.subheader("🎯 Player Props — SportsData.io")
+    st.caption("Pulls official NBA/NFL player props from SportsData.io with live odds and implied probabilities.")
 
+    # --- User Inputs ---
     props_date = st.date_input(
-        "Props Date",
+        "Select Props Date",
         value=date.today(),
-        key="sdata_date_picker"
+        key="sportsdata_date_input"
     )
     props_date_str = props_date.strftime("%Y-%m-%d")
 
+    sport_choice = st.selectbox(
+        "Select Sport",
+        ["NBA", "NFL"],
+        index=0,
+        key="sportsdata_sport_select"
+    )
+
     # --- Check for API key ---
-    if not sdata_key:
-        st.info("Enter your SportsData.io API key in the sidebar to fetch props.")
+    if not SPORTSDATA_KEY:
+        st.info("⚠️ Please enter your SportsData.io API key in the sidebar or .env to enable this feed.")
     else:
-        # --- Fetch raw data ---
-        raw_sdata = fetch_sportsdataio_props(sdata_key, sport, props_date_str)
+        # --- Construct API URL ---
+        sport_lower = sport_choice.lower()
+        url = f"https://api.sportsdata.io/v3/{sport_lower}/odds/json/PlayerPropsByDate/{props_date_str}"
 
-        # --- Normalize + extract ---
-        sdata_df = extract_sportsdataio_df(
-            raw_sdata.to_dict(orient="records")
-            if isinstance(raw_sdata, pd.DataFrame)
-            else raw_sdata
-        )
+        # --- Fetch raw JSON ---
+        try:
+            st.write("⏳ Fetching live player props from SportsData.io...")
+            headers = {"Ocp-Apim-Subscription-Key": SPORTSDATA_KEY}
+            response = requests.get(url, headers=headers, timeout=25)
 
+            if response.status_code != 200:
+                st.warning(f"⚠️ SportsData.io returned {response.status_code}: {response.text[:200]}")
+                sdata_df = pd.DataFrame()
+            else:
+                data = response.json()
+                sdata_df = extract_sportsdataio_df(data)
+
+        except Exception as e:
+            st.error(f"❌ Error fetching props: {e}")
+            sdata_df = pd.DataFrame()
+
+        # --- Display results ---
         if sdata_df.empty:
-            st.warning("No props returned right now for this sport/date.")
+            st.warning(f"No props found for {sport_choice} on {props_date_str}. Try another date or verify your key.")
         else:
-            with st.expander("Sample (head)", expanded=True):
-                st.dataframe(sdata_df.head(100), use_container_width=True)
+            st.success(f"✅ Loaded {len(sdata_df)} player props for {sport_choice} ({props_date_str})")
+
+            # --- Summary Metrics ---
+            avg_edge = sdata_df["EV_Pct"].mean() if "EV_Pct" in sdata_df.columns else None
+            if avg_edge is not None:
+                st.metric("Average EV%", f"{avg_edge:,.2f}%")
+
+            # --- Data Table ---
+            with st.expander("📋 View Player Props Data", expanded=True):
+                st.dataframe(
+                    sdata_df.head(150),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
             # --- CSV Export ---
             csv = sdata_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download CSV (SportsData.io Props)",
+                label="💾 Download Props CSV",
                 data=csv,
-                file_name=f"sportsdataio_props_{sport}_{props_date_str}.csv",
+                file_name=f"SportsDataIO_Props_{sport_choice}_{props_date_str}.csv",
                 mime="text/csv",
-                key="dl_sdata_props"
+                key="dl_sportsdata_props"
             )
 
-# -------- TAB 2: Game Lines (The Odds API) --------
+
+# -------- TAB 2: Game Lines — The Odds API --------
 with tabs[1]:
-    st.subheader("Game Lines — The Odds API")
+    st.subheader("🏈 Game Lines — The Odds API")
+    st.caption("Pulls live Moneyline, Spread, and Total odds for multiple sports.")
 
+    # --- Sport selection mapping ---
     sport_map_odds = {
-    "NBA": "basketball_nba",
-    "NFL": "americanfootball_nfl",
-    "MLB": "baseball_mlb",
-    "NCAAF": "americanfootball_ncaaf",
+        "NBA": "basketball_nba",
+        "NFL": "americanfootball_nfl",
+        "MLB": "baseball_mlb",
+        "NCAAF": "americanfootball_ncaaf",
+        "NCAAM": "basketball_ncaab",  # ✅ correct key for college basketball
+        "Soccer - EPL": "soccer_epl",
+        "Soccer - La Liga": "soccer_spain_la_liga",
+        "Soccer - Serie A": "soccer_italy_serie_a",
+        "Soccer - Bundesliga": "soccer_germany_bundesliga",
+        "Soccer - Ligue 1": "soccer_france_ligue_one",
+        "Soccer - MLS": "soccer_usa_mls",
+        "Soccer - UEFA Champions League": "soccer_uefa_champions_league",
+        "Soccer - UEFA Europa League": "soccer_uefa_europa_league",
+        "Soccer - World Cup": "soccer_fifa_world_cup",
+    }
 
-    # ⚽ All major soccer leagues supported by The Odds API
-    "Soccer - EPL": "soccer_epl",
-    "Soccer - La Liga": "soccer_spain_la_liga",
-    "Soccer - Serie A": "soccer_italy_serie_a",
-    "Soccer - Bundesliga": "soccer_germany_bundesliga",
-    "Soccer - Ligue 1": "soccer_france_ligue_one",
-    "Soccer - MLS": "soccer_usa_mls",
-    "Soccer - UEFA Champions League": "soccer_uefa_champions_league",
-    "Soccer - UEFA Europa League": "soccer_uefa_europa_league",
-    "Soccer - World Cup": "soccer_fifa_world_cup",
-}
-    sport_key = sport_map_odds.get(sport, "basketball_nba")
+    # --- Sport selection dropdown ---
+    selected_sport = st.selectbox(
+        "Select Sport / League",
+        list(sport_map_odds.keys()),
+        index=list(sport_map_odds.keys()).index("NBA"),
+        key="oddsapi_sport_select"
+    )
+    sport_key = sport_map_odds[selected_sport]
 
-    if not odds_key:
-        st.info("Enter your The Odds API key in the sidebar to fetch game lines.")
+    # --- Bookmaker Filter ---
+    available_books = ["hardrockbet", "draftkings", "fanduel", "caesars", "espnbet"]
+    selected_books = st.multiselect(
+        "Select Bookmakers",
+        options=available_books,
+        default=["hardrockbet"],
+        key="oddsapi_book_filter"
+    )
+    books_param = ",".join(selected_books)
+
+    # --- Min edge filter ---
+    min_edge = st.slider(
+        "Minimum EV% (Edge Filter)",
+        min_value=0.0, max_value=10.0, value=0.0, step=0.5,
+        key="oddsapi_min_edge"
+    )
+
+    # --- Check for API key ---
+    if not ODDSAPI_KEY:
+        st.info("⚠️ Please enter your The Odds API key in the sidebar or .env file.")
     else:
-        raw_odds = fetch_the_odds_api_games(odds_key, sport_key)
-        odds_df = extract_odds_api_df(raw_odds)
+        st.write(f"🎯 Querying **{selected_sport}** | Bookmakers: `{books_param}`")
 
-        if odds_df.empty:
-            st.warning("No odds returned.")
-        else:
-            with st.expander("Data (head)", expanded=True):
-                st.dataframe(odds_df.head(100), width="stretch")
-
-            csv = odds_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download CSV (The Odds API Game Lines)",
-                data=csv,
-                file_name=f"odds_api_{sport_key}_{today_str()}.csv",
-                mime="text/csv",
-                key="dl_odds_lines",
+        try:
+            from props_engine_plus import fetch_the_odds_api_games, extract_odds_api_df
+            raw_odds = fetch_the_odds_api_games(
+                api_key=ODDSAPI_KEY,
+                sport_key=sport_key,
+                bookmakers=books_param
             )
-            
-# -------- TAB 3: SportsgameOdds (Player Props + Markets) --------
-with tabs[2]:
-    st.subheader("SportsgameOdds — Player Props + Markets (Implied vs True)")
+            odds_df = extract_odds_api_df(raw_odds)
+        except Exception as e:
+            st.error(f"❌ Failed to retrieve or process Odds API data: {e}")
+            odds_df = pd.DataFrame()
 
-    # Optional auto-refresh for NBA/NFL
+        # --- Validate and Display ---
+        if odds_df.empty:
+            st.warning("No game lines found for this sport or bookmaker.")
+        else:
+            st.success(f"✅ Retrieved {len(odds_df)} lines from The Odds API")
+
+            # --- Apply filters ---
+            if "EV_Pct" in odds_df.columns:
+                odds_df = odds_df[odds_df["EV_Pct"].fillna(0) >= min_edge]
+
+            if odds_df.empty:
+                st.warning(f"No lines meet EV ≥ {min_edge}%")
+            else:
+                # --- Sort by EV% and TrueProb, then limit to top 50 ---
+                sort_cols = [c for c in ["EV_Pct", "TrueProb"] if c in odds_df.columns]
+                if sort_cols:
+                    odds_df = odds_df.sort_values(sort_cols, ascending=[False, False])
+
+                top50 = odds_df.head(50).reset_index(drop=True)
+
+                # --- Display table ---
+                st.markdown("### 📊 Top 50 Value-Ranked Odds (Sorted by EV% & TrueProb)")
+                st.caption(f"Displaying top {len(top50)} of {len(odds_df)} total results.")
+                styled_df = style_table(top50)
+                st.dataframe(styled_df, use_container_width=True, height=520, hide_index=True)
+
+                # --- CSV Download (Top 50 Only) ---
+                csv = top50.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download CSV (Top 50 Odds API Game Lines)",
+                    data=csv,
+                    file_name=f"odds_api_{sport_key}_{today_str()}.csv",
+                    mime="text/csv",
+                    key="dl_oddsapi_lines"
+                )
+
+                # --- Discord Push (Top 5) ---
+                if st.button("📢 Send Top 5 Value Lines to Discord", key="send_discord_oddsapi"):
+                    try:
+                        from props_engine_plus import format_recommended_msg, push_recommended
+                        top5 = top50.head(5).copy()
+                        msg = format_recommended_msg(
+                            f"💸 Top 5 Game Lines — {selected_sport.upper()} ({today_str()})",
+                            top5, top_n=5
+                        )
+                        push_recommended(top5, title=f"Top 5 Game Lines — {selected_sport.upper()}")
+                        st.success("✅ Sent Top 5 Game Lines to Discord!")
+                    except Exception as e:
+                        st.error(f"❌ Failed to send to Discord: {e}")                       
+
+# -------- TAB 3: SportsGameOdds — Player Props + Markets --------
+with tabs[2]:
+    st.subheader("🎯 SportsGameOdds — Player Props + Market Value Analysis")
+    st.caption("Real-time player props, edges, and probabilities from the SportsGameOdds API.")
+
     if auto_refresh and sport.upper() in ("NBA", "NFL"):
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=60 * 1000, key=f"auto_refresh_{sport.lower()}")
-        st.caption("🔄 Auto-refreshing every 60 seconds (NBA/NFL).")
+        st_autorefresh(interval=300 * 1000, key=f"auto_refresh_{sport.lower()}")
+        st.caption("🔄 Auto-refreshing every 300 seconds (NBA/NFL).")
 
     sgo_league_map = {
         "NBA": "NBA",
         "NFL": "NFL",
         "MLB": "MLB",
+        "NHL": "NHL",
+        "NCAAM":"NCAAM",
         "NCAAF": "NCAAF",
-        "Soccer": "SOC"
+        "Soccer": "SOC",
     }
     league_id = sgo_league_map.get(sport, "NBA")
 
-    if not sgo_key:
-        st.info("Enter your SportsGameOdds API key in the sidebar to fetch live props & markets.")
+    if not SGO_KEY:
+        st.info("⚠️ Please enter your SportsGameOdds API key in the sidebar or .env file.")
     else:
-        # --- Fetch & process ---
-        payload = fetch_sgo_events(sgo_key, league_id, limit=50)
-        sgo_df = extract_sgo_df(payload, wanted_books=book_filter)
+        try:
+            check_sgo_usage(SGO_KEY)
+        except Exception:
+            pass
+
+        st.write(f"📡 Fetching live {league_id} props & markets from SportsGameOdds...")
+        try:
+            payload = fetch_sgo_events(
+                sgo_api_key=SGO_KEY,
+                league_id=league_id,
+                limit=100
+            )
+            sgo_df = extract_sgo_df(
+                payload,
+                wanted_books=["hardrockbet", "draftkings", "fanduel", "caesars", "espnbet"]
+            )
+        except Exception as e:
+            st.error(f"❌ Error fetching SGO data: {e}")
+            sgo_df = pd.DataFrame()
 
         if sgo_df.empty:
-            st.warning("No markets/props returned. (If your tier is limited, try a smaller league or remove filters.)")
+            st.warning("No props or markets returned. Try adjusting filters or check API tier limits.")
         else:
-            # --- Filters ---
-            colf1, colf2, colf3 = st.columns([1, 1, 1])
+            st.success(f"✅ Loaded {len(sgo_df)} props from SportsGameOdds ({league_id})")
 
-            with colf1:
+            st.markdown("### 🔍 Filters")
+            col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+
+            with col1:
                 unique_markets = sorted(sgo_df["MarketType"].dropna().unique().tolist())
-                chosen_market = st.selectbox(
-                    "Market Type",
-                    ["All"] + unique_markets,
-                    index=0,
-                    key="sgo_market_select"
-                )
+                chosen_market = st.selectbox("Market Type", ["All"] + unique_markets, index=0)
 
-            with colf2:
-                player_q = st.text_input("Player name contains (optional)", "", key="sgo_player_query")
+            with col2:
+                player_q = st.text_input("Filter by Player Name", "")
 
-            with colf3:
-                edge_min = st.number_input("Min Edge %", value=edge_floor, step=0.5, key="sgo_edge_min")
+            with col3:
+                unique_games = sorted(sgo_df["Game"].dropna().unique().tolist())
+                chosen_game = st.selectbox("Game Matchup", ["All"] + unique_games, index=0)
 
-            # --- Apply filters ---
+            with col4:
+                edge_min = st.number_input("Min Edge %", value=3.0, step=0.5)
+
             filtered = sgo_df.copy()
             if chosen_market != "All":
                 filtered = filtered[filtered["MarketType"] == chosen_market]
+            if chosen_game != "All":
+                filtered = filtered[filtered["Game"] == chosen_game]
             if player_q.strip():
-                filtered = filtered[filtered["Player"].fillna("").str.contains(player_q.strip(), case=False, na=False)]
+                filtered = filtered[
+                    filtered["Player"].fillna("").str.contains(player_q.strip(), case=False, na=False)
+                ]
             if edge_min is not None:
                 filtered = filtered[(filtered["EdgePct"].fillna(-9999) >= float(edge_min))]
 
-            # --- Display ---
-            if not filtered.empty:
-                show = filtered.copy()
-                show["ImpliedProb%"] = show["ImpliedProb"].apply(fmt_pct)
-                show["TrueProb%"] = show["TrueProb"].apply(fmt_pct)
-                show["Edge%"] = show["EdgePct"].map(lambda x: f"{x:0.2f}%" if pd.notna(x) else "")
+            if filtered.empty:
+                st.info("ℹ️ No props matched your filters.")
+            else:
+                st.markdown(f"### 📊 Filtered Results ({len(filtered)} props shown)")
+                styled_df = style_table(filtered)
+                st.dataframe(styled_df, use_container_width=True, height=550, hide_index=True)
 
-                show = show.drop(columns=["ImpliedProb", "TrueProb", "EdgePct"], errors="ignore")
-                st.dataframe(show, use_container_width=True, height=520)
-
-                # --- CSV Export ---
                 csv = filtered.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "Download CSV (SGO Props + Markets)",
+                    "💾 Download CSV (SGO Props + Markets)",
                     data=csv,
                     file_name=f"sgo_{league_id}_{today_str()}.csv",
-                    mime="text/csv",
-                    key="dl_sgo_csv"
+                    mime="text/csv"
                 )
-            else:
-                st.info("No rows match your filters.")
-                
-# -------- TAB 4: Recommended Bets (Unified + Discord) --------
-with tabs[3]:
-    st.subheader("🎯 Recommended Bets — Unified (SGO + OddsAPI + SportsData)")
-    st.caption("Combines player props and team odds across sources. Filters for high-value edges and win probability ≥ 60%.")
 
-    # ==========================================================
-    # 🧩 STEP 1 — Combine Available Data Sources
-    # ==========================================================
+                if st.button("📢 Send Top 5 Recommended Bets to Discord", key="send_discord_sgo"):
+                    try:
+                        from props_engine_plus import format_recommended_msg, send_discord, DISCORD_WEBHOOK
+                        top5 = filtered.copy()
+                        if "TrueProb" in top5.columns:
+                            top5 = top5[top5["TrueProb"] >= 0.53]
+                        top5 = top5.sort_values("EV_Pct", ascending=False).head(5)
+                        if top5.empty:
+                            st.warning("⚠️ No bets meet the True Probability ≥ 53% threshold.")
+                        else:
+                            top5["DisplayName"] = top5.apply(
+                                lambda x: x["Player"] if pd.notna(x["Player"]) and x["Player"] != "None"
+                                else x.get("Game", "Unknown Game"),
+                                axis=1,
+                            )
+                            msg_title = f"🎯 Top 5 Recommended Bets — {sport.upper()} ({today_str()})"
+                            msg_lines = [
+                                f"**{row['DisplayName']}** — {row['MarketName']} | {row['Side']} {row['Line']} | ({row['BookOdds']})"
+                                for _, row in top5.iterrows()
+                            ]
+                            msg = msg_title + "\n" + "\n".join(msg_lines)
+                            if DISCORD_WEBHOOK:
+                                send_discord(msg, DISCORD_WEBHOOK)
+                                st.success("✅ Sent Top 5 Recommended Bets to Discord!")
+                            else:
+                                st.warning("⚠️ Discord webhook not found in .env.")
+                    except Exception as e:
+                        st.error(f"❌ Failed to send to Discord: {e}")
+                        
+ # -------- TAB 4: Recommended Bets (Unified + Discord) --------
+with tabs[3]:
+    st.subheader("💡 Recommended Bets — Unified (SGO + OddsAPI + SportsData)")
+    st.caption("Combines player props and team odds across sources. Filters for high-value edges and win probability thresholds.")
+
+    # ==============================
+    # 🧠 STEP 1 – Combine Available Data Sources
+    # ==============================
     try:
         available_dfs = []
-
         if "odds_df" in locals() and isinstance(odds_df, pd.DataFrame) and not odds_df.empty:
             available_dfs.append(odds_df)
         if "sgo_df" in locals() and isinstance(sgo_df, pd.DataFrame) and not sgo_df.empty:
@@ -1589,157 +1170,507 @@ with tabs[3]:
         if "sdata_df" in locals() and isinstance(sdata_df, pd.DataFrame) and not sdata_df.empty:
             available_dfs.append(sdata_df)
 
-        combined_df = pd.concat(available_dfs, ignore_index=True, sort=False) if available_dfs else pd.DataFrame()
+        combined_df = (
+            pd.concat(available_dfs, ignore_index=True, sort=False)
+            if available_dfs else pd.DataFrame()
+        )
     except Exception as e:
-        st.warning(f"Error combining datasets: {e}")
+        st.warning(f"⚠️ Error combining datasets: {e}")
         combined_df = pd.DataFrame()
 
-    # ==========================================================
-    # ⚙️ STEP 2 — Apply Real-Time Adjustments (Injury + Weather)
-    # ==========================================================
+    # Ensure EV/Kelly present if any source missed them
     if not combined_df.empty:
         try:
-            sport_choice = "nba" if "NBA" in combined_df["League"].astype(str).unique().tolist() else "nfl"
+            if not set(["EV_Pct", "Kelly_Pct", "HalfKelly_Pct", "HalfKellyCapped_Pct"]).issubset(combined_df.columns):
+                from props_engine_plus import compute_value_metrics
+                combined_df = compute_value_metrics(combined_df, odds_col="BookOdds")
         except Exception:
-            sport_choice = "nfl"
+            pass  # non-blocking; most sources already include these
 
-        # detect home city from first game
-        first_game = str(combined_df["Game"].iloc[0]) if "Game" in combined_df.columns else ""
-        city_guess = detect_city_from_game(first_game) or "miami"
-
+    # ============================================================
+    # ⚙️ STEP 2 — Apply Real-Time Adjustments (Injury + Weather)
+    # ============================================================
+    if not combined_df.empty:
         try:
-            injuries_df = fetch_injuries(sport_choice)
-        except Exception as e:
-            st.warning(f"⚠️ Injury fetch failed: {e}")
-            injuries_df = pd.DataFrame()
+            # Pick a sport for injury endpoint (simple heuristic)
+            try:
+                sport_choice = "nba" if "NBA" in combined_df["League"].astype(str).unique().tolist() else "nfl"
+            except Exception:
+                sport_choice = "nfl"
 
-        try:
-            weather_data = fetch_weather(city_guess)
-        except Exception as e:
-            st.warning(f"⚠️ Weather fetch failed: {e}")
-            weather_data = {}
+            # Pull injuries (ok if empty)
+            try:
+                injuries_df = fetch_injuries(sport_choice)
+            except Exception as e:
+                st.warning(f"⚠️ Injury fetch failed: {e}")
+                injuries_df = pd.DataFrame()
 
-        # ✅ Apply adjustments only if data is available
-        try:
-            if (not injuries_df.empty) or (weather_data and len(weather_data) > 0):
-                combined_df["AdjTrueProb"] = combined_df.apply(
-                    lambda r: adjust_true_probability(r, injuries_df), axis=1
-                )
-            else:
-                st.info("No injury or weather data available — skipping adjustments.")
-                combined_df["AdjTrueProb"] = combined_df.get("TrueProb", 0)
+            # Adjust each row; adjust_true_probability() handles weather internally
+            combined_df["AdjTrueProb"] = combined_df.apply(
+                lambda r: adjust_true_probability(r, injuries_df), axis=1
+            )
+
+            # If AdjTrueProb created, optionally recalc EV/Kelly off adjusted prob (non-destructive)
+            if "AdjTrueProb" in combined_df.columns:
+                from props_engine_plus import american_to_decimal
+
+                def _recalc(row):
+                    p = row.get("AdjTrueProb", None)
+                    o = row.get("BookOdds", None)
+                    try:
+                        if p is None or pd.isna(p) or o is None or str(o).strip() == "":
+                            return pd.Series([
+                                row.get("EV_Pct"), row.get("Kelly_Pct"),
+                                row.get("HalfKelly_Pct"), row.get("HalfKellyCapped_Pct")
+                            ])
+                        dec = american_to_decimal(o)
+                        ev = ((p * dec) - 1) * 100.0 if (dec not in (None, 0)) else row.get("EV_Pct")
+                        # Kelly with "true" p
+                        b = dec - 1 if dec else None
+                        kelly = ((p * b - (1 - p)) / b * 100.0) if (b and b != 0) else row.get("Kelly_Pct")
+                        half = (kelly / 2.0) if kelly is not None else None
+                        half_cap = min(half, 10.0) if half is not None else None
+                        return pd.Series([ev, kelly, half, half_cap])
+                    except Exception:
+                        return pd.Series([
+                            row.get("EV_Pct"), row.get("Kelly_Pct"),
+                            row.get("HalfKelly_Pct"), row.get("HalfKellyCapped_Pct")
+                        ])
+
+                combined_df[["EV_Pct", "Kelly_Pct", "HalfKelly_Pct", "HalfKellyCapped_Pct"]] = \
+                    combined_df.apply(_recalc, axis=1)
         except Exception as e:
             st.warning(f"⚠️ Adjustment step skipped due to error: {e}")
             combined_df["AdjTrueProb"] = combined_df.get("TrueProb", 0)
 
-    # ==========================================================
-    # 🎯 STEP 3 — Filter for Recommended Bets
-    # ==========================================================
+    # ============================================================
+    # ♻️ STEP 3 — Recalibrate Model Using Bet History (optional)
+    # ============================================================
+    st.subheader("♻️ Model Recalibration (Learning from My Bets)")
+    st.caption("Calibrates TrueProb via logistic regression when ≥ 50 bets are logged (model_feedback_log.csv).")
+
+    auto_calibrated = False
+    try:
+        if os.path.exists("model_feedback_log.csv"):
+            feedback = pd.read_csv("model_feedback_log.csv")
+            if len(feedback) >= 50:
+                feedback, calib_model = logistic_calibrate(
+                    feedback,
+                    prob_col="TrueProb",
+                    outcome_col="Outcome"
+                )
+                feedback.to_csv("model_feedback_log_calibrated.csv", index=False)
+                st.info(f"🤖 Auto-calibrated using {len(feedback)} historical bets.")
+                auto_calibrated = True
+    except Exception as e:
+        st.warning(f"⚠️ Auto-calibration skipped due to error: {e}")
+
+    if st.button("🚀 Recalibrate Model from Bet History", key="retrain_model"):
+        try:
+            feedback = pd.read_csv("model_feedback_log.csv")
+            feedback, calib_model = logistic_calibrate(
+                feedback,
+                prob_col="TrueProb",
+                outcome_col="Outcome"
+            )
+            feedback.to_csv("model_feedback_log_calibrated.csv", index=False)
+            st.success("✅ Model recalibrated manually using logistic regression.")
+        except Exception as e:
+            st.warning(f"⚠️ Manual calibration failed: {e}")
+
+    if not auto_calibrated:
+        st.caption("ℹ️ Auto-calibration triggers once 50+ bets are logged.")
+
+    # ============================================================
+    # 🎯 STEP 4 — Filter for Recommended Bets (tunable controls)
+    # ============================================================
+    rec_df = pd.DataFrame()  # guard for later use
+
     if not combined_df.empty:
-        rec_df = combined_df[
-            (combined_df["EV_Pct"].fillna(0) > 5) &
-            (combined_df["HalfKelly_Pct"].fillna(0) > 2) &
-            (combined_df["AdjTrueProb"].fillna(0) >= 0.60)
-        ].copy()
+        st.markdown("### 🎛️ Recommendation Filters")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            min_ev = st.number_input("Min EV %", value=5.0, step=0.5, key="rec_min_ev")
+        with c2:
+            max_ev = st.number_input("Max EV %", value=20.0, step=0.5, key="rec_max_ev")
+        with c3:
+            min_half_kelly = st.number_input("Min Half-Kelly %", value=2.0, step=0.5, key="rec_min_half_kelly")
+        with c4:
+            min_true = st.number_input("Min True Prob", value=0.50, step=0.01, key="rec_min_true")
+
+        # Prefer adjusted prob if present; else fallback to TrueProb
+        prob_col = "AdjTrueProb" if "AdjTrueProb" in combined_df.columns else "TrueProb"
+
+        try:
+            rec_df = combined_df[
+                (combined_df["EV_Pct"].fillna(0).between(min_ev, max_ev)) &
+                (combined_df["HalfKelly_Pct"].fillna(0) > float(min_half_kelly)) &
+                (combined_df[prob_col].fillna(0) >= float(min_true))
+            ].copy()
+        except Exception:
+            rec_df = pd.DataFrame()
 
         if rec_df.empty:
-            st.warning("No high-edge bets found (EV > 5%, Half Kelly > 2%, True Prob ≥ 60%).")
+            st.warning(
+                f"⚠️ No bets found with EV {min_ev:.1f}%–{max_ev:.1f}%, "
+                f"Half Kelly > {min_half_kelly:.1f}%, and {prob_col} ≥ {min_true:.2f}."
+            )
         else:
-            rec_df = rec_df.sort_values(["EV_Pct", "HalfKelly_Pct"], ascending=False)
+            rec_df = rec_df.sort_values(["EV_Pct", "HalfKelly_Pct"], ascending=False).reset_index(drop=True)
             st.dataframe(rec_df.head(50), use_container_width=True, height=520)
 
-            # --- CSV export ---
+            # CSV download
             csv = rec_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download Recommended Bets (CSV)",
+                "⬇️ Download Recommended Bets (CSV)",
                 data=csv,
                 file_name=f"recommended_bets_{today_str()}.csv",
                 mime="text/csv",
-                key="dl_recbets"
+                key="dl_recommended_csv",
             )
+    else:
+        st.warning("⚠️ No combined data available for recommendations.")
 
-            # ======================================================
-            # 🔔 STEP 4 — Send to Discord
-            # ======================================================
-            if st.button("📢 Send Top Bets to Discord", key="send_discord_tab4"):
-                top10 = rec_df.head(10)
-                msg = format_recommended_msg(f"Top Value Picks — {today_str()}", top10, top_n=10)
+    # ============================================================
+    # 🔔 STEP 5 — Send to Discord
+    # ============================================================
+    if st.button("📤 Send Top Bets to Discord", key="send_discord_tab4"):
+        try:
+            if rec_df.empty:
+                st.warning("⚠️ No recommended bets to send. Adjust filters first.")
+            else:
+                top10 = rec_df.head(10).copy()
+                msg = format_recommended_msg(f"🔥 Top Value Picks — {today_str()}", top10, top_n=10)
 
-                try:
-                    from props_engine_plus import send_discord, DISCORD_WEBHOOK
-
-                    if DISCORD_WEBHOOK:
-                        send_discord(msg, DISCORD_WEBHOOK)
-                        st.success("✅ Sent Top 10 Picks to Discord!")
-                    else:
-                        st.warning("⚠️ Discord webhook not found in .env file.")
-                except Exception as e:
-                    st.error(f"❌ Failed to send to Discord: {e}")
-                
-# -------- TAB 5: AI-Driven Recommended Bets (Props Engine + EV + Kelly) --------
+                from props_engine_plus import send_discord, DISCORD_WEBHOOK
+                if DISCORD_WEBHOOK:
+                    send_discord(msg, DISCORD_WEBHOOK)
+                    st.success("✅ Sent Top 10 Picks to Discord!")
+                else:
+                    st.warning("⚠️ Discord webhook not found in .env file.")
+        except Exception as e:
+            st.error(f"❌ Failed to send to Discord: {e}")
+            
+# -------- TAB 5: AI-Driven Recommended Bets --------
 with tabs[4]:
     st.subheader("🤖 AI-Driven Recommended Bets (Props Engine + EV + Kelly)")
-    st.caption("Automatically scans all available props, filters for True Prob ≥ 60% and strong +EV signals.")
+    st.caption("Auto-scans props & game lines, filters for True Prob ≥ 60 % and strong +EV signals.")
 
-    bankroll = st.number_input("💰 Bankroll ($)", min_value=10, max_value=10000, value=100)
+    bankroll = st.number_input("💰 Bankroll ($)", 10, 10000, 500, 50)
+    st.markdown("### 🚀 Running AI Auto-Scan Across All Sources…")
 
-    st.markdown("### 🚀 Running AI Auto-Scan Across All Available Sources...")
+    # --- Normalize league naming for consistency (so NCAAM / NCAAB work) ---
+    for df_name in ["odds_df", "sgo_df", "sdata_df"]:
+        if df_name in locals():
+            df = locals()[df_name]
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                if "League" in df.columns:
+                    df["League"] = (
+                        df["League"]
+                        .astype(str)
+                        .str.replace("basketball_ncaam", "NCAAB", regex=False)
+                        .str.replace("basketball_ncaab", "NCAAB", regex=False)
+                        .str.replace("college_basketball", "NCAAB", regex=False)
+                    )
+                locals()[df_name] = df
 
-    # --- Merge all available sources safely ---
+    # --- Combine available dataframes ---
     sources = []
     for df_name in ["odds_df", "sgo_df", "sdata_df"]:
         if df_name in locals():
             df = locals()[df_name]
             if isinstance(df, pd.DataFrame) and not df.empty:
                 sources.append(df)
+    all_data = pd.concat(sources, ignore_index=True, sort=False) if sources else pd.DataFrame()
 
-    if sources:
-        all_data = pd.concat(sources, ignore_index=True, sort=False).dropna(subset=["EV_Pct"], how="any")
-    else:
-        all_data = pd.DataFrame()
+    # --- Ensure required columns exist ---
+    base_cols = [
+        "Player", "Game", "MarketType", "Side", "Line",
+        "Bookmaker", "BookOdds", "TrueProb", "EV_Pct", "HalfKelly_Pct"
+    ]
+    for c in base_cols:
+        if c not in all_data.columns:
+            all_data[c] = np.nan
 
+    # --- Display name logic ---
+    all_data["DisplayName"] = all_data.apply(
+        lambda x: x["Player"]
+        if pd.notna(x["Player"]) and str(x["Player"]).strip()
+        else (x["Game"] if pd.notna(x["Game"]) else "Unknown"),
+        axis=1,
+    )
+
+    # --- Market detection for default slider presets ---
+    market_hint = (
+        "props"
+        if all_data["Player"].notna().any()
+        else "moneyline"
+        if all_data["MarketType"].astype(str).str.contains("h2h", case=False, na=False).any()
+        else "spread"
+        if all_data["MarketType"].astype(str).str.contains("spread", case=False, na=False).any()
+        else "default"
+    )
+    st.markdown(f"Detected Market Type: **{market_hint.title()}**")
+
+    presets = {
+        "moneyline": {"ev": 3.0, "kelly": 1.0, "true": 0.58},
+        "spread": {"ev": 5.0, "kelly": 2.0, "true": 0.60},
+        "props": {"ev": 6.0, "kelly": 2.5, "true": 0.62},
+        "default": {"ev": 5.0, "kelly": 2.0, "true": 0.60},
+    }
+    p = presets.get(market_hint, presets["default"])
+
+    min_ev = st.slider("Min EV %", 0.0, 15.0, p["ev"], 0.5)
+    min_kelly = st.slider("Min Half-Kelly %", 0.0, 10.0, p["kelly"], 0.5)
+    min_true = st.slider("Min True Prob (Adj)", 0.0, 1.0, p["true"], 0.01)
+
+    # --- Stop early if no data ---
     if all_data.empty:
-        st.warning("⚠️ No betting data available from Odds API / SportsData / SGO.")
-    else:
-        try:
-            # --- Apply filters ---
-            ai_df = all_data[
-                (all_data["EV_Pct"].fillna(0) > 5) &
-                (all_data["HalfKelly_Pct"].fillna(0) > 2) &
-                (all_data.get("AdjTrueProb", all_data["TrueProb"]).fillna(0) >= 0.60)
-            ].copy()
+        st.warning("⚠️ No betting data available to scan.")
+        st.stop()
 
-            if ai_df.empty:
-                st.info("No AI bets met thresholds (EV > 5%, Half Kelly > 2%, True Prob ≥ 60%).")
-            else:
-                ai_df = ai_df.sort_values(["EV_Pct", "HalfKelly_Pct"], ascending=False)
-                top10 = ai_df.head(10)
+    try:
+        ai_df = all_data[
+            (all_data["EV_Pct"].fillna(0) >= min_ev)
+            & (all_data["HalfKelly_Pct"].fillna(0) >= min_kelly)
+            & (all_data.get("AdjTrueProb", all_data["TrueProb"]).fillna(0) >= min_true)
+        ].copy()
 
-                st.dataframe(top10, use_container_width=True, height=520)
+        if ai_df.empty:
+            st.info(
+                f"No AI bets met thresholds (EV ≥ {min_ev:.1f} %, Half Kelly ≥ {min_kelly:.1f} %, True Prob ≥ {min_true:.2f})."
+            )
+        else:
+            ai_df = ai_df.sort_values(["EV_Pct", "HalfKelly_Pct"], ascending=False).reset_index(drop=True)
+            top10 = ai_df.head(10)
+            st.success(f"✅ Found {len(ai_df)} AI-qualified bets — showing top 10")
 
-                # --- Export CSV ---
-                csv = ai_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "⬇️ Download AI Recommendations (CSV)",
-                    data=csv,
-                    file_name=f"ai_recommended_bets_{today_str()}.csv",
-                    mime="text/csv",
-                    key="dl_ai_bets",
+            # --- Format line column with color emojis ---
+            def color_line(row):
+                line = str(row.get("Line", "")).strip()
+                if not line:
+                    return ""
+                mt = str(row.get("MarketType", "")).lower()
+                if "spread" in mt:
+                    return f"🟩 {line}" if "+" in line else f"🟥 {line}"
+                if "total" in mt or "totals" in mt:
+                    return f"🟧 {line}"
+                return line
+
+            top10["Line"] = top10.apply(color_line, axis=1)
+
+            # --- Columns to display ---
+            display_cols = [
+                "DisplayName", "MarketType", "Side", "Line",
+                "Bookmaker", "BookOdds", "TrueProb", "EV_Pct", "HalfKelly_Pct"
+            ]
+
+            # --- Style helper ---
+            def style_ai(df):
+                return (
+                    df.style
+                    .bar(subset=["EV_Pct"], color=["#e63946", "#2a9d8f"], vmin=0, vmax=df["EV_Pct"].max())
+                    .bar(subset=["HalfKelly_Pct"], color=["#f4a261", "#2a9d8f"], vmin=0, vmax=df["HalfKelly_Pct"].max())
+                    .format({
+                        "BookOdds": "{:.2f}",
+                        "TrueProb": "{:.2f}",
+                        "EV_Pct": "{:.2f} %",
+                        "HalfKelly_Pct": "{:.2f} %",
+                    }, na_rep="")
+                    .hide(axis="index")
                 )
 
-                # --- Discord Push Button ---
-                st.markdown("### 🔔 Send AI Picks to Discord")
-                if st.button("📢 Push AI Top 10 to Discord", key="send_discord_ai"):
-                    try:
-                        msg = format_recommended_msg(f"AI Top Value Picks — {today_str()}", top10, top_n=10)
-                        push_recommended(top10, title="AI Top Value Picks")
-                        st.success("✅ AI Top 10 Picks sent to Discord!")
-                    except Exception as e:
-                        st.error(f"❌ Failed to send to Discord: {e}")
+            # --- Display main table ---
+            st.markdown("### 📊 AI-Ranked Opportunities (Top 10)")
 
+            # --- Legend for line colors and EV% bars ---
+            st.markdown("""
+            <div style='padding: 10px; background-color: #1a1a1a; border-radius: 8px; border: 1px solid #333;'>
+            <b>🎨 Line & EV% Color Legend</b><br>
+            🟩 <b>Positive Line / Underdog Value</b> — indicates a favorable or +spread line.<br>
+            🟥 <b>Negative Line / Favorite</b> — indicates a tighter or high-confidence side.<br>
+            🟧 <b>Total / Over–Under</b> — represents game total lines (not spread or moneyline).<br><br>
+            <b>📊 EV% Color Bar:</b><br>
+            <span style='color:#e63946;'>🔴 Low Edge</span> → <span style='color:#f4a261;'>🟠 Moderate Edge</span> → <span style='color:#2a9d8f;'>🟢 High Edge</span><br>
+            Bars represent relative expected value and Kelly strength.
+            </div>
+            """, unsafe_allow_html=True)
+
+            styled_df = style_ai(top10[display_cols])
+            st.dataframe(styled_df, use_container_width=True, height=550)
+
+            # --- CSV Export (Top 50 only) ---
+            csv = ai_df.head(50).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download AI Recommendations (CSV – Top 50)",
+                data=csv,
+                file_name=f"ai_recommended_bets_{today_str()}.csv",
+                mime="text/csv",
+            )
+
+            # --- Discord Push (Top 5) ---
+            st.markdown("### 🔔 Send AI Picks to Discord")
+            if st.button("📢 Push AI Top 5 to Discord", key="send_discord_ai_top5"):
+                try:
+                    from props_engine_plus import send_discord, DISCORD_WEBHOOK
+
+                    # Pick sport emoji
+                    def sport_emoji(name):
+                        name = str(name).lower()
+                        if "nba" in name or "basketball" in name:
+                            return "🏀"
+                        if "nfl" in name or "football" in name:
+                            return "🏈"
+                        if "mlb" in name or "baseball" in name:
+                            return "⚾"
+                        if "soccer" in name or "fifa" in name:
+                            return "⚽"
+                        if "nhl" in name or "hockey" in name:
+                            return "🏒"
+                        if "ncaab" in name:
+                            return "🎓🏀"
+                        return "🎯"
+
+                    league_sample = str(top10.get("League", "")).lower()
+                    emoji = sport_emoji(league_sample)
+
+                    msg_lines = [f"**{emoji} AI Top Value Picks — {today_str()}**\n"]
+                    for _, row in top10.head(5).iterrows():
+                        name = row.get("DisplayName", "Unknown Game")
+                        market = row.get("MarketType", "Unknown")
+                        side = row.get("Side", "")
+                        line = row.get("Line", "")
+                        odds = row.get("BookOdds", "")
+                        book = row.get("Bookmaker", "")
+                        ev = f"{row.get('EV_Pct', 0):.2f}%"
+                        tp = f"{row.get('TrueProb', 0):.2f}"
+                        msg_lines.append(f"🎯 **{name}** — {market.title()} | {side} {line} ({odds}) @ *{book}* ↳ TrueProb: {tp}, EV: {ev}")
+
+                    msg = "\n".join(msg_lines)
+                    if DISCORD_WEBHOOK:
+                        send_discord(msg, DISCORD_WEBHOOK)
+                        st.success("✅ AI Top 5 Picks sent to Discord!")
+                    else:
+                        st.warning("⚠️ Discord webhook not found in .env")
+                except Exception as e:
+                    st.error(f"❌ Discord push failed: {e}")
+
+    except Exception as e:
+        st.error(f"❌ Error during AI auto-scan: {e}")
+        
+# ==========================================================
+# TAB 6: ⚙️ Engine & Discord Control Panel (Manual Run + History)
+# ==========================================================
+with tabs[5]:
+    import pandas as pd, os, altair as alt, subprocess
+
+    st.header("⚙️ Engine & Discord Control Panel")
+    st.caption("Manually trigger the AI engine, monitor bankroll trends, and review Discord output logs.")
+
+    st.divider()
+
+    # ===================================================
+    # 🚀 ENGINE RUN SECTION
+    # ===================================================
+    st.markdown("### 🚀 Run Parlay Engine")
+    st.write("Click below to refresh live odds, rebuild parlays, and push results to Discord.")
+
+    engine_script = "refresh_live_odds.py"
+    if not os.path.exists(engine_script):
+        st.warning(f"⚠️ Engine script not found: {engine_script}")
+    else:
+        if st.button("🎯 Run Engine & Post to #best-parlay", key="run_engine"):
+            try:
+                with st.spinner("Running engine... this may take up to 2 minutes"):
+                    res = subprocess.run(
+                        ["python3", engine_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                if res.returncode == 0:
+                    st.success("✅ Engine executed successfully!")
+                    st.code(res.stdout or "(no output)")
+                else:
+                    st.warning(f"⚠️ Engine completed with warnings (code {res.returncode})")
+                    st.code(res.stderr or "(no stderr)")
+            except subprocess.TimeoutExpired:
+                st.error("❌ Engine timed out (120 s limit). Try again or check your script.")
+            except Exception as e:
+                st.error(f"❌ Error while running engine: {e}")
+
+    st.divider()
+
+    # ===================================================
+    # 📊 HISTORY + BANKROLL TREND
+    # ===================================================
+    st.markdown("### 📊 Parlay History & Bankroll Trend")
+
+    hist_path = "data/parlay_history.csv"
+    os.makedirs(os.path.dirname(hist_path), exist_ok=True)
+
+    if os.path.exists(hist_path):
+        try:
+            hist = pd.read_csv(hist_path)
+            if "Timestamp" in hist.columns:
+                hist["Timestamp"] = pd.to_datetime(hist["Timestamp"], errors="coerce")
+
+            # --- Summary metrics
+            total_profit = round(hist.get("ExpectedProfit", pd.Series(dtype=float)).sum(), 2)
+            avg_ev = round(hist.get("EV%", pd.Series(dtype=float)).mean(), 2)
+            current_bankroll = round(hist.get("BankrollAfter", pd.Series([0])).iloc[-1], 2)
+            win_rate = (
+                (hist["Outcome"].str.lower().eq("win").mean() * 100)
+                if "Outcome" in hist.columns
+                else 0
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("💰 Total Profit", f"${total_profit}")
+            c2.metric("📈 Avg EV %", f"{avg_ev:.2f}%")
+            c3.metric("🏦 Current Bankroll", f"${current_bankroll}")
+            c4.metric("🎯 Win Rate", f"{win_rate:.1f}%")
+
+            # --- Recent history table
+            st.markdown("#### Recent History")
+            st.dataframe(hist.tail(10), use_container_width=True)
+
+            # --- Bankroll trend chart
+            if {"BankrollAfter", "Timestamp"}.issubset(hist.columns):
+                chart = (
+                    alt.Chart(hist.dropna(subset=["BankrollAfter"]))
+                    .mark_line(point=True, color="#00b4d8")
+                    .encode(
+                        x=alt.X("Timestamp:T", title="Date/Time"),
+                        y=alt.Y("BankrollAfter:Q", title="Bankroll ($)"),
+                        tooltip=["Timestamp", "BankrollAfter", "ExpectedProfit"],
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(chart, use_container_width=True)
         except Exception as e:
-            st.error(f"❌ Error during AI auto-scan: {e}")
-            
+            st.error(f"⚠️ Failed to load history: {e}")
+    else:
+        st.warning("No history found yet. Run the engine to create data/parlay_history.csv.")
+
+    st.divider()
+
+    # ===================================================
+    # 🧠 DISCORD OUTPUT LOG
+    # ===================================================
+    st.markdown("### 🧠 Discord Output Log")
+    st.info("Displays the latest results posted to your Discord webhook via the engine or AI tabs.")
+
+    if os.path.exists(hist_path):
+        try:
+            hist = pd.read_csv(hist_path)
+            cols = [c for c in ["Timestamp", "Legs", "ExpectedProfit", "BankrollAfter"] if c in hist.columns]
+            st.dataframe(hist.tail(5)[cols], use_container_width=True)
+        except Exception as e:
+            st.error(f"⚠️ Failed to read Discord log: {e}")
+    else:
+        st.warning("No parlay log available yet — run the engine once to generate logs.")
+
 # ============== Footer ==============
 st.markdown("---")
 st.caption("© Parlay +EV Pro — all odds and props are for informational purposes only.")

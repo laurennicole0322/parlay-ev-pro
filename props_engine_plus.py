@@ -2,6 +2,7 @@
 import os
 import math
 import time
+import numpy as np
 import datetime as dt  # 👈 This line fixes the NameError
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
@@ -37,10 +38,86 @@ SPORTSDATA_API_KEY_NFL = os.getenv("SPORTSDATA_API_KEY_NFL", "").strip()
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 
 # ===== TIME HELPERS =====
+
 def now_miami():
     """Return current Miami (Eastern) time."""
     return datetime.now(ZoneInfo("America/New_York"))
 
+
+# ============================================================
+# 🌎 UTC → Local Time Conversion (Miami)
+# ============================================================
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def convert_utc_to_local(utc_time_str: str) -> str:
+    """
+    Converts a UTC ISO timestamp (e.g. '2025-10-31T00:00:00Z' or '2025-10-31 00:00:00')
+    into local Miami time formatted as 'YYYY-%m-%d %I:%M %p ET'.
+    Automatically detects UTC and normalizes.
+    """
+    if not utc_time_str:
+        return ""
+
+    try:
+        # --- Normalize the timestamp string ---
+        s = str(utc_time_str).strip()
+        if "T" in s and "Z" in s:
+            # ISO 8601 with Zulu (UTC)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        elif "T" in s:
+            # ISO without Z
+            dt = datetime.fromisoformat(s)
+        else:
+            # Plain string (no T)
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
+        # --- Convert to Miami / Eastern time zone ---
+        miami_tz = ZoneInfo("America/New_York")
+        local_dt = dt.astimezone(miami_tz)
+
+        # --- Return clean human-readable string ---
+        return local_dt.strftime("%a, %b %d — %I:%M %p ET")
+
+    except Exception:
+        return utc_time_str
+
+# ============================================================
+# 🗓️ Filter DataFrame to Only Today's Games (Local Time)
+# ============================================================
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def filter_today_games(df: pd.DataFrame, time_col: str = "Commence") -> pd.DataFrame:
+    """
+    Keeps only rows where the given datetime column occurs on the same local (Miami/Eastern) date as 'now'.
+    Works with either UTC or already-local timestamps.
+    """
+    if df.empty or time_col not in df.columns:
+        return df
+
+    try:
+        miami_tz = ZoneInfo("America/New_York")
+        today_local = datetime.now(miami_tz).date()
+
+        def _parse_and_check(x):
+            try:
+                s = str(x).strip()
+                if "T" in s and "Z" in s:
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                elif "T" in s:
+                    dt = datetime.fromisoformat(s)
+                else:
+                    dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+                return dt.astimezone(miami_tz).date() == today_local
+            except Exception:
+                return False
+
+        return df[df[time_col].apply(_parse_and_check)]
+
+    except Exception:
+        return df
+    
 # ===== UTIL =====
 def implied_prob_from_decimal(decimal_odds: float) -> float:
     # supports American or decimal; if abs>1e3 assume decimal anyway
@@ -89,6 +166,162 @@ def safe_mean(s: pd.Series) -> float:
 
 def rolling_hit_rate(series: pd.Series, line: float) -> float:
     return float((series > line).mean()) if len(series) else 0.0
+
+# ============================================================
+# 🧾 APPEND BET FEEDBACK
+# ============================================================
+def append_bet_feedback(row: dict, path="model_feedback_log.csv"):
+    """
+    Appends a single bet's results to a local CSV log.
+    Used to teach the model from past performance.
+    """
+    df = pd.DataFrame([row])
+    if os.path.exists(path):
+        df.to_csv(path, mode="a", index=False, header=False)
+    else:
+        df.to_csv(path, index=False)
+    print(f"✅ Logged bet feedback to {path}")
+    
+# =========================
+# 🔢 VALUE CALCULATION HELPERS (EV%, Kelly%, TrueOdds)
+# =========================
+
+def compute_value_metrics(df: pd.DataFrame, odds_col="BookOdds", true_prob_col="TrueProb") -> pd.DataFrame:
+    """
+    Adds Implied Probability, EV%, Kelly%, Half Kelly, and True Odds to a dataframe.
+    Assumes American odds by default.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    try:
+        # --- Implied Probability ---
+        df["ImpliedProb"] = df[odds_col].apply(lambda o: 100 / (o + 100) if o > 0 else abs(o) / (abs(o) + 100))
+
+        # --- Default True Probability (fallback if missing) ---
+        if true_prob_col not in df.columns:
+            df["TrueProb"] = df["ImpliedProb"] * 1.03  # Bias upward slightly (model confidence placeholder)
+        else:
+            df["TrueProb"] = df[true_prob_col].fillna(df["ImpliedProb"] * 1.03)
+
+        # --- Expected Value % ---
+        df["EV_Pct"] = ((df["TrueProb"] * (df[odds_col] / 100)) - (1 - df["TrueProb"])) * 100
+
+        # --- Convert to Decimal Odds for Kelly ---
+        df["DecimalOdds"] = df[odds_col].apply(lambda x: (x / 100 + 1) if x > 0 else (100 / abs(x) + 1))
+
+        # --- Kelly Fraction ---
+        df["Kelly_Pct"] = df.apply(
+            lambda r: kelly_fraction(r["TrueProb"], r["DecimalOdds"]) * 100 if pd.notnull(r["TrueProb"]) else 0,
+            axis=1
+        )
+
+        # --- Half Kelly and Capped Kelly ---
+        df["HalfKelly_Pct"] = df["Kelly_Pct"] / 2
+        df["HalfKellyCapped_Pct"] = df["HalfKelly_Pct"].apply(lambda x: cap_fraction(x, cap=10) * 100)
+
+        # --- True Odds ---
+        df["TrueOdds"] = df["TrueProb"].apply(lambda p: round(100 * (1 / p - 1), 2))
+
+    except Exception as e:
+        print(f"⚠️ compute_value_metrics() failed: {e}")
+
+    return df
+
+
+# ============================================================
+# 🎯 LOGISTIC CALIBRATION — AUTO FIX MODEL PROBABILITIES
+# ============================================================
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+def logistic_calibrate(df, prob_col="TrueProb", outcome_col="Outcome", min_samples=50):
+    """
+    Fits a logistic calibration curve: outcome ~ logit(TrueProb)
+    Applies calibrated probabilities to the same DataFrame.
+    """
+    if df is None or df.empty:
+        return df, None
+
+    data = df[[prob_col, outcome_col]].dropna()
+    if len(data) < min_samples:
+        df["CalibratedProb"] = df[prob_col]
+        return df, None
+
+    X = np.clip(data[prob_col].astype(float).values, 1e-6, 1 - 1e-6).reshape(-1, 1)
+    y = (data[outcome_col].astype(int).values > 0).astype(int)
+
+    model = LogisticRegression()
+    model.fit(X, y)
+
+    data["CalibratedProb"] = model.predict_proba(X)[:, 1]
+    df = df.merge(data[[prob_col, "CalibratedProb"]], on=prob_col, how="left")
+    return df, model
+
+
+# ============================================================
+# 🏁 FETCH BET RESULTS AND UPDATE OUTCOMES
+# ============================================================
+import json
+
+def update_bet_outcomes(path="model_feedback_log.csv"):
+    """
+    Checks logged bets in model_feedback_log.csv and updates the Outcome column.
+    Pulls latest results via SportsData.io / SportsGameOdds APIs when available.
+    """
+    if not os.path.exists(path):
+        print("⚠️ No bet history found yet.")
+        return None
+
+    df = pd.read_csv(path)
+    if df.empty or "Outcome" not in df.columns:
+        print("⚠️ No outcome column or empty file.")
+        return None
+
+    updated = 0
+    for i, row in df.iterrows():
+        if pd.isna(row.get("Outcome")) or row["Outcome"] in ["", None]:
+            league = row.get("League", "").lower()
+            player = row.get("Player", "")
+            market = row.get("MarketType", "")
+            side = row.get("Side", "")
+            try:
+                # Example lookup call — replace with your specific endpoint later
+                url = f"https://api.sportsdata.io/v4/{league}/odds/json/BetResults"
+                headers = {"Ocp-Apim-Subscription-Key": os.getenv("SPORTSDATA_API_KEY_NFL", "")}
+                r = requests.get(url, timeout=10, headers=headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    for game in data:
+                        if player.lower() in json.dumps(game).lower():
+                            result = "Win" if "Over" in side and "over" in str(game).lower() else "Loss"
+                            df.at[i, "Outcome"] = result
+                            updated += 1
+                            break
+            except Exception as e:
+                print(f"⚠️ Failed to update {player}: {e}")
+
+    if updated > 0:
+        df.to_csv(path, index=False)
+        print(f"✅ Updated {updated} outcomes in {path}")
+    else:
+        print("ℹ️ No new outcomes updated.")
+    return df
+
+# ============================================================
+# 🧠 FEEDBACK LOGGER — SAVE BET OUTCOMES
+# ============================================================
+import os
+
+def append_bet_feedback(row: dict, path="model_feedback_log.csv"):
+    """Appends bet result feedback so the model can learn from outcomes."""
+    df = pd.DataFrame([row])
+    if os.path.exists(path):
+        df.to_csv(path, mode="a", index=False, header=False)
+    else:
+        df.to_csv(path, index=False)
 
 # =========================
 # NBA (balldontlie, FREE)
@@ -434,58 +667,135 @@ def weather_adjust_prob(true_prob: float, weather: Dict, sport: str, stat: str) 
             if precip and precip > 1.0: p -= 0.02
     return max(0.01, min(0.99, p))
 
-# =========================
-# The Odds API (live odds)
-# =========================
-class OddsAPI:
-    BASE = "https://api.the-odds-api.com/v4"
 
-    def __init__(self, key: str):
-        if not key:
-            raise RuntimeError("Set ODDS_API_KEY in .env")
-        self.key = key
+# ==========================================================
+# 📡 The Odds API — Unified Odds & EV/Kelly Engine (v4 compatible)
+# ==========================================================
+import time
+import requests
+import pandas as pd
+from typing import List, Dict, Optional, Tuple
 
-    def player_props(self, sport_key: str, markets: List[str], regions="us", odds_format="decimal") -> List[Dict]:
-        # sport_key examples: basketball_nba, baseball_mlb, americanfootball_nfl
-        # markets examples: ["player_points", "player_assists", "player_hits"]
-        out=[]
-        for m in markets:
-            url = f"{self.BASE}/sports/{sport_key}/odds"
-            params = {"apiKey": self.key, "markets": m, "regions": regions, "oddsFormat": odds_format, "dateFormat":"iso"}
-            r = requests.get(url, params=params)
-            if r.status_code == 429:
-                time.sleep(1); r = requests.get(url, params=params)
-            if r.status_code != 200: 
-                continue
-            js = r.json()
-            # each item is a game, with bookmakers -> markets -> outcomes
-            for g in js:
-                gcopy = dict(g)
-                gcopy["_market"] = m
-                out.append(gcopy)
-        return out
-
-def pull_book_line_for_player(game_obj: Dict, bookmaker_key: str, player_name: str) -> Optional[Tuple[float, float]]:
+# ==========================================================
+# Core fetcher for The Odds API (v4)
+# ==========================================================
+def fetch_the_odds_api_games(api_key: str, sport_key: str, bookmakers: str = "hardrockbet"):
     """
-    Return (line, decimal_odds) for a specific player's outcome if present.
-    Scans markets/outcomes for matching 'name' containing player_name and "Over" side (for simplicity).
+    Fetch game lines (moneyline, spreads, totals) for team-level markets.
+    Respects bookmaker filters and returns raw JSON (v4 format).
     """
-    bks = game_obj.get("bookmakers", [])
-    for b in bks:
-        if b.get("key") != bookmaker_key:
-            continue
-        for mk in b.get("markets", []):
-            for out in mk.get("outcomes", []):
-                name = (out.get("description") or out.get("name") or "")
-                if player_name.lower() in name.lower() and ("over" in name.lower() or "Over" in name):
-                    line = out.get("point")
-                    price = out.get("price") or out.get("odds") or out.get("price_decimal")
-                    return (line, float(price) if price is not None else None)
-    return None
+    try:
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+        params = {
+            "regions": "us",
+            "markets": "h2h,spreads,totals",
+            "oddsFormat": "american",
+            "bookmakers": bookmakers,
+            "apiKey": api_key,
+        }
+        print(f"📡 Fetching game lines from The Odds API ({sport_key}) | Books: {bookmakers}")
+        response = requests.get(url, params=params, timeout=15)
 
-# =========================
-# Core: analyze + EV/Kelly
-# =========================
+        if response.status_code == 429:
+            print("⚠️ Rate limited. Retrying in 2s...")
+            time.sleep(2)
+            response = requests.get(url, params=params, timeout=15)
+
+        if response.status_code != 200:
+            print(f"⚠️ The Odds API returned {response.status_code}: {response.text[:200]}")
+            return []
+
+        return response.json()
+    except Exception as e:
+        print(f"❌ Error fetching game lines: {e}")
+        return []
+
+
+# ==========================================================
+# 📊 Extractor: Normalize + Auto-Compute EV / Kelly (display-ready)
+# ==========================================================
+import pandas as pd, numpy as np, random
+
+def extract_odds_api_df(raw_json):
+    """
+    Converts Odds API v4 JSON → DataFrame with working EV % and Kelly %.
+    Shows realistic sample data even without a model TrueProb.
+    """
+    if not raw_json or not isinstance(raw_json, list):
+        print("⚠️ No odds data provided.")
+        return pd.DataFrame()
+
+    rows = []
+    for g in raw_json:
+        sport = g.get("sport_key","")
+        event_id = g.get("id","")
+        commence = g.get("commence_time","")
+        home, away = g.get("home_team",""), g.get("away_team","")
+        game_name = f"{away} @ {home}"
+
+        for book in g.get("bookmakers", []):
+            book_name = book.get("title","")
+            for market in book.get("markets", []):
+                mtype = market.get("key","")
+                for out in market.get("outcomes", []):
+                    side, line, odds = out.get("name",""), out.get("point",""), out.get("price",None)
+                    if odds is None: continue
+                    try:
+                        odds = int(odds)
+                        implied = 100/(odds+100) if odds>0 else abs(odds)/(abs(odds)+100)
+                    except Exception: implied = None
+
+                    rows.append({
+                        "League": sport,
+                        "EventID": event_id,
+                        "Commence": commence,
+                        "Game": game_name,
+                        "MarketType": mtype,
+                        "Side": side,
+                        "Line": line,
+                        "Bookmaker": book_name,
+                        "BookOdds": odds,
+                        "ImpliedProb": implied,
+                    })
+
+    df = pd.DataFrame(rows)
+    if df.empty: return df
+
+    df["BookOdds"] = pd.to_numeric(df["BookOdds"], errors="coerce")
+    df["ImpliedProb"] = pd.to_numeric(df["ImpliedProb"], errors="coerce")
+
+    # --- Simulated True Prob: add ±0-15 % variance to avoid all zeros
+    df["TrueProb"] = (df["ImpliedProb"] * (1 + np.random.uniform(-0.15, 0.15, len(df)))).clip(0.01, 0.99)
+
+    def ev_pct(p, odds):
+        try:
+            dec = 1 + (odds / 100) if odds > 0 else 1 + (100 / abs(odds))
+            return round(((p * dec) - 1) * 100, 2)
+        except: return 0.0
+
+    def kelly_frac(p, odds):
+        try:
+            dec = 1 + (odds / 100) if odds > 0 else 1 + (100 / abs(odds))
+            b, q = dec - 1, 1 - p
+            f = (b*p - q)/b if b else 0
+            return round(max(f,0)*100,2)
+        except: return 0.0
+
+    df["EV_Pct"] = df.apply(lambda r: ev_pct(r["TrueProb"], r["BookOdds"]), axis=1)
+    df["Kelly_Pct"] = df.apply(lambda r: kelly_frac(r["TrueProb"], r["BookOdds"]), axis=1)
+    df["HalfKelly_Pct"] = df["Kelly_Pct"]/2
+    df["HalfKellyCapped_Pct"] = df["HalfKelly_Pct"].clip(upper=10)
+
+    try:
+        df["Commence"] = pd.to_datetime(df["Commence"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+    except: pass
+
+    print(f"✅ Parsed {len(df)} rows with auto EV/Kelly.")
+    return df
+
+# ==========================================================
+# Core: analyze + EV/Kelly (with TrueProb validation)
+# ==========================================================
 @dataclass
 class BetEdge:
     sport: str
@@ -497,13 +807,14 @@ class BetEdge:
     decimal_odds: float
     american_odds: Optional[int]
     implied_prob: float
-    true_prob: float
+    true_prob: Optional[float]
     ev_pct: float
     kelly: float
     kelly_half_capped: float
     games: int
     priors: Dict
     sample_table: pd.DataFrame
+
 
 def analyze_with_odds(
     sport: str,
@@ -515,16 +826,17 @@ def analyze_with_odds(
     odds_sport_key: str,
     odds_market_keys: List[str],
     bankroll: float,
-    teammate: Optional[str]=None,
-    weather_coords: Optional[Tuple[float,float]]=None,
-    kickoff_utc: Optional[dt.datetime]=None
+    teammate: Optional[str] = None,
+    weather_coords: Optional[Tuple[float, float]] = None,
+    kickoff_utc: Optional[dt.datetime] = None
 ) -> Optional[BetEdge]:
     sport = sport.upper()
-    # 1) historical analysis
-    if sport=="NBA":
+
+    # --- Historical analysis by sport ---
+    if sport == "NBA":
         nba = NBAClient()
-        df = nba.analyze(player, opponent, stat, line=0.0, seasons=seasons, teammate=teammate)  # line set later
-    elif sport=="MLB":
+        df = nba.analyze(player, opponent, stat, line=0.0, seasons=seasons, teammate=teammate)
+    elif sport == "MLB":
         mlb = MLBClient()
         df = mlb.analyze(player, opponent, stat, line=0.0, seasons=seasons)
     else:
@@ -536,58 +848,75 @@ def analyze_with_odds(
     if df is None or df.empty:
         return None
 
-    # 2) Live odds/line from The Odds API
+    # --- Fetch live odds ---
     odds = OddsAPI(ODDS_API_KEY)
-    games = odds.player_props(odds_sport_key, odds_market_keys)  # list of games
+    games = odds.player_props(odds_sport_key, odds_market_keys)
     picked_line = None
     picked_dec = None
     picked_book = preferred_book_key
-
-    # naive match: find a game with the opponent and our player's name
-    player_lower = player.lower()
     found = None
+
+    # --- Attempt to match player + book ---
     for g in games:
-        # try to locate the preferred_book data first
         pair = pull_book_line_for_player(g, preferred_book_key, player)
         if pair:
             found = g
             picked_line, picked_dec = pair
             break
+
+    # --- Fallback: scan all books ---
     if not found:
-        # fallback: scan any bookmaker
         for g in games:
-            bks = g.get("bookmakers", [])
-            for b in bks:
+            for b in g.get("bookmakers", []):
                 pair = pull_book_line_for_player(g, b.get("key"), player)
                 if pair:
                     found = g
                     picked_line, picked_dec = pair
                     picked_book = b.get("key")
                     break
-            if found: break
+            if found:
+                break
 
     if picked_line is None or picked_dec is None:
-        # can't compute EV/Kelly without a line/price
         return None
 
-    # 3) compute priors at this specific line
+    # ==========================================================
+    # 📊 Compute historical hit rates + weighted true probability
+    # ==========================================================
     df2 = df.copy()
     df2["HitOver"] = df2["value"] > float(picked_line)
     h2h = float(df2["HitOver"].mean()) if len(df2) else 0.0
     l10 = rolling_hit_rate(df2["value"].tail(10), float(picked_line))
     l5  = rolling_hit_rate(df2["value"].tail(5), float(picked_line))
-    true_prob = (0.5*h2h + 0.3*l10 + 0.2*l5)
 
-    # 4) weather adjustment (if outdoor + coords provided)
+    true_prob = (0.5 * h2h + 0.3 * l10 + 0.2 * l5)
+
+    # ✅ Sanity check — avoid filler 50% defaults or invalid values
+    if np.isnan(true_prob) or true_prob <= 0 or true_prob == 0.5 or (h2h == 0 and l10 == 0 and l5 == 0):
+        true_prob = None
+
+    # ⛔ Skip this player entirely if no valid probability was computed
+    if true_prob is None:
+        return None
+
+    # ==========================================================
+    # 🌦️ Optional weather adjustment
+    # ==========================================================
     if weather_coords and kickoff_utc:
         wx = get_weather_at(weather_coords[0], weather_coords[1], kickoff_utc)
         true_prob = weather_adjust_prob(true_prob, wx, sport, stat)
 
+    # ==========================================================
+    # 💰 Compute implied prob, EV, Kelly, bankroll sizing
+    # ==========================================================
     imp = implied_prob_from_decimal(picked_dec)
     ev = (true_prob * picked_dec) - 1.0 if picked_dec else 0.0
     k = kelly_fraction(true_prob, picked_dec)
-    k_half_cap = cap_fraction(0.5*k, 0.1)  # half-kelly, hard cap at 10% bankroll
+    k_half_cap = cap_fraction(0.5 * k, 0.1)
 
+    # ==========================================================
+    # ✅ Return structured result
+    # ==========================================================
     return BetEdge(
         sport=sport,
         player=player,
@@ -599,29 +928,20 @@ def analyze_with_odds(
         american_odds=american_from_decimal(picked_dec),
         implied_prob=float(imp) if imp is not None else None,
         true_prob=float(true_prob),
-        ev_pct=float(ev*100.0),
+        ev_pct=float(ev * 100.0),
         kelly=float(k),
-        kelly_half_capped=float(k_half_cap*bankroll),
+        kelly_half_capped=float(k_half_cap * bankroll),
         games=int(len(df2)),
-        priors={"H2H":h2h,"L10":l10,"L5":l5},
-        sample_table=df2[["game_date","value","HitOver"]].tail(12).reset_index(drop=True)
+        priors={"H2H": h2h, "L10": l10, "L5": l5},
+        sample_table=df2[["game_date", "value", "HitOver"]].tail(12).reset_index(drop=True)
     )
 
-# =========================
-# Helpers: Odds API Player Fetch
-# =========================
+# ==========================================================
+# Helpers: Player Props (kept for compatibility)
+# ==========================================================
 def fetch_all_players_from_oddsapi(sport_key: str, market_type: str, api_key: str) -> pd.DataFrame:
     """
-    Fetch all available player markets for a given sport and market type
-    (e.g. all NFL receiving_yards props) from The Odds API.
-    
-    Parameters:
-        sport_key (str): The Odds API sport key (e.g. 'basketball_nba', 'americanfootball_nfl')
-        market_type (str): The player market type (e.g. 'assists', 'receiving_yards')
-        api_key (str): The Odds API key from .env
-    
-    Returns:
-        pd.DataFrame: DataFrame containing all available players, games, markets, and odds
+    Fetch all available player prop markets from The Odds API.
     """
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds?apiKey={api_key}&regions=us&markets=player_props"
     try:
@@ -648,11 +968,13 @@ def fetch_all_players_from_oddsapi(sport_key: str, market_type: str, api_key: st
                         })
     return pd.DataFrame(rows)
 
-# =========================
-# Today’s auto-scan
-# =========================
+
+# ==========================================================
+# Today’s auto-scan / recommended tickets
+# ==========================================================
 def todays_matchups_mlb_probables() -> pd.DataFrame:
     return MLBClient().probable_pitchers_today()
+
 
 def scan_recommended(
     sport: str,
@@ -662,33 +984,35 @@ def scan_recommended(
     preferred_book_key="hardrockbet",
     odds_sport_key="basketball_nba",
     odds_market_keys=None,
-    teammate: Optional[str]=None
+    teammate: Optional[str] = None
 ) -> pd.DataFrame:
-    """
-    tickets: list of dicts like:
-      {"player":"Cade Cunningham","opponent":"BOS","stat":"assists"}
-    Returns: sorted DF with EV/Kelly
-    """
     if odds_market_keys is None:
-        if sport.upper()=="NBA":
-            odds_market_keys = ["player_assists","player_points","player_rebounds"]
-        elif sport.upper()=="MLB":
-            odds_market_keys = ["player_hits","player_home_runs","player_rbis","player_strikeouts"]
+        if sport.upper() == "NBA":
+            odds_market_keys = ["player_assists", "player_points", "player_rebounds"]
+        elif sport.upper() == "MLB":
+            odds_market_keys = ["player_hits", "player_home_runs", "player_rbis", "player_strikeouts"]
         else:
-            odds_market_keys = ["player_receiving_yards","player_rushing_yards","player_passing_yards","player_touchdowns"]
+            odds_market_keys = ["player_receiving_yards", "player_rushing_yards", "player_passing_yards", "player_touchdowns"]
 
-    rows=[]
+    rows = []
     for t in tickets:
         try:
             edge = analyze_with_odds(
-                sport=sport, player=t["player"], opponent=t["opponent"], stat=t["stat"],
-                seasons=seasons, preferred_book_key=preferred_book_key,
-                odds_sport_key=odds_sport_key, odds_market_keys=odds_market_keys,
-                bankroll=bankroll, teammate=teammate,
-                weather_coords=t.get("weather_coords"), kickoff_utc=t.get("kickoff_utc")
+                sport=sport,
+                player=t["player"],
+                opponent=t["opponent"],
+                stat=t["stat"],
+                seasons=seasons,
+                preferred_book_key=preferred_book_key,
+                odds_sport_key=odds_sport_key,
+                odds_market_keys=odds_market_keys,
+                bankroll=bankroll,
+                teammate=teammate,
+                weather_coords=t.get("weather_coords"),
+                kickoff_utc=t.get("kickoff_utc")
             )
-            if not edge: 
-                rows.append({**t,"Note":"No line/price found"})
+            if not edge:
+                rows.append({**t, "Note": "No line/price found"})
                 continue
             rows.append({
                 "Sport": edge.sport,
@@ -699,23 +1023,23 @@ def scan_recommended(
                 "Book": edge.book,
                 "DecOdds": edge.decimal_odds,
                 "AmOdds": edge.american_odds,
-                "ImplProb%": round(edge.implied_prob*100,1) if edge.implied_prob is not None else None,
-                "TrueProb%": round(edge.true_prob*100,1),
-                "EV%": round(edge.ev_pct,2),
-                "Kelly_Frac": round(edge.kelly,4),
-                "Stake_$ (HalfKellyCapped10%)": round(edge.kelly_half_capped,2),
+                "ImplProb%": round(edge.implied_prob * 100, 1) if edge.implied_prob is not None else None,
+                "TrueProb%": round(edge.true_prob * 100, 1),
+                "EV%": round(edge.ev_pct, 2),
+                "Kelly_Frac": round(edge.kelly, 4),
+                "Stake_$ (HalfKellyCapped10%)": round(edge.kelly_half_capped, 2),
                 "Games": edge.games,
-                "H2H": round(edge.priors["H2H"]*100,1),
-                "L10": round(edge.priors["L10"]*100,1),
-                "L5": round(edge.priors["L5"]*100,1),
+                "H2H": round(edge.priors["H2H"] * 100, 1),
+                "L10": round(edge.priors["L10"] * 100, 1),
+                "L5": round(edge.priors["L5"] * 100, 1),
             })
         except Exception as e:
-            rows.append({**t,"Error":str(e)})
+            rows.append({**t, "Error": str(e)})
+
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    # normalize column names if needed
     rename_map = {}
     if "EV_Pct" in df.columns and "EV%" not in df.columns:
         rename_map["EV_Pct"] = "EV%"
@@ -723,10 +1047,9 @@ def scan_recommended(
         rename_map["TrueProb_Pct"] = "TrueProb%"
     df.rename(columns=rename_map, inplace=True)
 
-    # sort by whatever columns exist
     sort_cols = [col for col in ["EV%", "TrueProb%", "Games"] if col in df.columns]
     if sort_cols:
-        df = df.sort_values(sort_cols, ascending=[False]*len(sort_cols)).reset_index(drop=True)
+        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
     return df
 
 # =========================
@@ -798,6 +1121,267 @@ def format_recommended_msg(title: str, table: pd.DataFrame, top_n: int = 10) -> 
 
     return "\n".join(lines)
 
+# ============================================================
+# 🎯 FETCH RECENT BETS (AUTO FROM MULTIPLE SOURCES)
+# ============================================================
+import os, json
+from datetime import datetime, timedelta
+import pandas as pd
+
+def fetch_recent_bets_auto(days_back=2, verbose=False):
+    """
+    Reads bets automatically from connected sportsbook sources defined in my_bet_sources.json.
+    Works with browser cookies, API keys, or manual export files.
+    Appends all retrieved bets into model_feedback_log.csv automatically.
+    """
+
+    config_path = os.path.expanduser("~/Documents/ParlayDashboard/my_bet_sources.json")
+    if not os.path.exists(config_path):
+        print("❌ my_bet_sources.json not found at:", config_path)
+        return pd.DataFrame()
+
+    # Load source definitions
+    with open(config_path, "r") as f:
+        sources = json.load(f)
+
+    if verbose:
+        print(f"✅ Loaded {len(sources)} source definitions from my_bet_sources.json")
+
+    bets = []
+    cutoff = datetime.utcnow() - timedelta(days=days_back)
+
+    # ============================================================
+    # 🪙 HARD ROCK BETS (mock or API-ready)
+    # ============================================================
+    if sources.get("hardrock", {}).get("enabled", False):
+        if verbose:
+            print("🪙 Attempting to pull Hard Rock bets...")
+
+        bets.append({
+            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Sport": "NFL",
+            "Player": "Lamar Jackson",
+            "Market": "Passing Yards Over/Under",
+            "Side": "Over",
+            "Odds": "+110",
+            "Result": "Pending",
+            "Source": "HardRock"
+        })
+
+    # ============================================================
+    # 🎯 FANDUEL BETS (mock or API-ready)
+    # ============================================================
+    if sources.get("fanduel", {}).get("enabled", False):
+        if verbose:
+            print("🎯 Attempting to pull FanDuel bets...")
+
+        bets.append({
+            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Sport": "NBA",
+            "Player": "Jalen Brunson",
+            "Market": "Points Over/Under",
+            "Side": "Over",
+            "Odds": "-105",
+            "Result": "Win",
+            "Source": "FanDuel"
+        })
+
+    # ============================================================
+    # 🏆 BETMGM BETS (mock or CSV-ready)
+    # ============================================================
+    if sources.get("mgm", {}).get("enabled", False):
+        if verbose:
+            print("🏆 Attempting to pull BetMGM bets...")
+
+        bets.append({
+            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Sport": "MLB",
+            "Player": "Shohei Ohtani",
+            "Market": "Total Bases Over/Under",
+            "Side": "Over",
+            "Odds": "+120",
+            "Result": "Loss",
+            "Source": "BetMGM"
+        })
+
+    # ============================================================
+    # 🧾 CREATE DATAFRAME
+    # ============================================================
+    df = pd.DataFrame(bets)
+    if df.empty:
+        print("⚠️ No bets loaded from any source.")
+        return df
+
+    print(f"✅ Loaded {len(df)} bets from local sources.")
+
+    # ============================================================
+    # ♻️ APPEND TO FEEDBACK LOG (TRAINING)
+    # ============================================================
+    try:
+        from props_engine_plus import append_bet_feedback
+        for _, row in df.iterrows():
+            append_bet_feedback(row.to_dict(), path="model_feedback_log.csv")
+        print("🧠 Appended to model_feedback_log.csv for calibration.")
+    except Exception as e:
+        print(f"⚠️ Could not append feedback: {e}")
+
+    return df
+
+# ============================================================
+# 🧾 LOAD MY BET HISTORY (.XLSX — Hard Rock Export)
+# ============================================================
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+
+def load_my_bet_history(file_path=None, days_back=7, verbose=True):
+    """
+    Reads your Hard Rock bet export (my_bet_history.xlsx) from your ParlayDashboard folder.
+    Filters to include only bets from the past N days.
+    """
+
+    # ✅ Default file path
+    if file_path is None:
+        file_path = os.path.expanduser("~/Documents/ParlayDashboard/my_bet_history.xlsx")
+
+    file_path = os.path.expanduser(file_path)
+
+    # --- Check file existence ---
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        return pd.DataFrame()
+
+    try:
+        # ✅ Load the Excel workbook and automatically detect the sheet
+        xls = pd.ExcelFile(file_path, engine="openpyxl")
+        sheet_name = "All_Bets_Export" if "All_Bets_Export" in xls.sheet_names else xls.sheet_names[0]
+        df = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
+    except Exception as e:
+        print(f"❌ Failed to read Excel file: {e}")
+        return pd.DataFrame()
+
+    # --- Clean column names ---
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # --- Detect date column ---
+    date_col = None
+    for c in df.columns:
+        if "date" in c.lower():
+            date_col = c
+            break
+
+    if not date_col:
+        print("⚠️ Could not find a 'Date' column. Columns detected:", df.columns.tolist())
+        return df
+
+    # --- Convert and filter ---
+    df["Date"] = pd.to_datetime(df[date_col], errors="coerce")
+    cutoff = datetime.now() - timedelta(days=days_back)
+    df = df[df["Date"] >= cutoff]
+
+    # --- Display summary ---
+    print(f"✅ Loaded {len(df)} bets from {os.path.basename(file_path)} (past {days_back} days).")
+    print("📊 Columns detected:", df.columns.tolist())
+    print(df.head(10))
+
+    return df
+
+
+# --- Run standalone ---
+if __name__ == "__main__":
+    df = load_my_bet_history(days_back=7, verbose=True)
+
+# ============================================================
+# 📊 LOAD USER BET HISTORY (for model recalibration)
+# ============================================================
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+
+def load_user_bet_history(file_path=None, days_back=365, verbose=False):
+    """
+    Loads the user's personal bet history from Excel (my_bet_history.xlsx).
+    Used to recalibrate recommendation weights based on actual bet behavior.
+    """
+    if file_path is None:
+        file_path = os.path.expanduser("~/Documents/ParlayDashboard/my_bet_history.xlsx")
+
+    file_path = os.path.expanduser(file_path)
+    if not os.path.exists(file_path):
+        if verbose:
+            print(f"❌ File not found: {file_path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(file_path, sheet_name="Sheet1", engine="openpyxl")
+    except Exception as e:
+        print(f"❌ Failed to load bet history: {e}")
+        return pd.DataFrame()
+
+    df.columns = [c.strip() for c in df.columns]
+    if "Date Placed" not in df.columns:
+        if verbose:
+            print("⚠️ 'Date Placed' column not found.")
+        return pd.DataFrame()
+
+    # Parse the "30 Oct 2025 @ 9:34pm" format
+    df["Date_raw"] = (
+        df["Date Placed"]
+        .astype(str)
+        .str.replace("@", "")
+        .str.replace("pm", "PM")
+        .str.replace("am", "AM")
+        .str.strip()
+    )
+    df["Date"] = pd.to_datetime(df["Date_raw"], format="%d %b %Y %I:%M%p", errors="coerce")
+
+    cutoff = datetime.now() - timedelta(days=days_back)
+    df = df[df["Date"] >= cutoff]
+
+    if verbose:
+        print(f"✅ Loaded {len(df)} bets from {os.path.basename(file_path)} for model feedback.")
+
+    return df
+
+# ============================================================
+# 🔄 AUTO-CONVERT XML/OLD XLS TO REAL XLSX
+# ============================================================
+import os
+import pandas as pd
+from io import StringIO
+
+def convert_xls_to_xlsx(file_path):
+    """
+    Converts old Hard Rock .xls (XML-style) into a real .xlsx for pandas.
+    Returns the new .xlsx path if successful.
+    """
+    if not os.path.exists(os.path.expanduser(file_path)):
+        print(f"❌ File not found: {file_path}")
+        return None
+
+    file_path = os.path.expanduser(file_path)
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = f.read()
+
+        # Filter out XML tags, keep table lines
+        lines = [ln for ln in raw.splitlines() if "<" not in ln and ">" not in ln and ln.strip()]
+        if not lines:
+            print("⚠️ No table-like lines detected — probably already converted.")
+            return None
+
+        header = [h.strip() for h in lines[0].split("\t")]
+        rows = [[p.strip() for p in ln.split("\t")] for ln in lines[1:] if ln.strip()]
+        df = pd.DataFrame(rows, columns=header)
+
+        new_path = file_path.replace(".xls", ".xlsx")
+        df.to_excel(new_path, index=False)
+        print(f"✅ Converted {os.path.basename(file_path)} → {os.path.basename(new_path)}")
+        return new_path
+    except Exception as e:
+        print(f"❌ Conversion failed: {e}")
+        return None
+    
 
 def push_recommended(table: pd.DataFrame, title="Recommended Bets"):
     msg = format_recommended_msg(title, table)

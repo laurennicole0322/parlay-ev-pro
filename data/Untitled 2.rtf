@@ -1,0 +1,153 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0     # ---- SportsgameOdds Combined Tab ----\
+    with tabs[2]:\
+        st.subheader("\uc0\u55356 \u57263  SportsgameOdds \'97 Live Player Props & Raw Markets")\
+\
+        from streamlit_autorefresh import st_autorefresh\
+\
+        # --- Auto-refresh for live NBA/NFL ---\
+        if sport.upper() in ["NBA", "NFL"]:\
+            st_autorefresh(interval=60 * 1000, key=f"auto_refresh_\{sport.lower()\}")\
+            st.caption("\uc0\u55357 \u56580  Auto-refresh every 60 seconds for live NBA/NFL markets")\
+        else:\
+            st.caption("\uc0\u9208  Auto-refresh disabled for this sport")\
+\
+        # --- Supported Sports Mapping ---\
+        sgo_map = \{"NBA": "nba", "NFL": "nfl", "MLB": "mlb", "Soccer": "soccer"\}\
+        if sport not in sgo_map:\
+            st.info("SportsgameOdds data available for NBA, NFL, MLB, and Soccer.")\
+        else:\
+            sport_slug = sgo_map[sport]\
+            headers = \{"X-Api-Key": SGO_API_KEY\}\
+\
+            # --- Market Name Normalizer ---\
+            def normalize_market_key(market_key):\
+                key = str(market_key).lower()\
+                if "points" in key and "ou" in key:\
+                    return "Player Points Over/Under"\
+                if "rebounds" in key and "ou" in key:\
+                    return "Player Rebounds Over/Under"\
+                if "assists" in key and "ou" in key:\
+                    return "Player Assists Over/Under"\
+                if "threepointersmade" in key and "ou" in key:\
+                    return "Player 3PT Made Over/Under"\
+                if "double" in key and "yn" in key:\
+                    return "Player Double/Triple Double Yes/No"\
+                if "touchdowns" in key and "ou" in key:\
+                    return "Player Touchdowns Over/Under"\
+                if "firsttouchdown" in key and "yn" in key:\
+                    return "Player First Touchdown Yes/No"\
+                if "passing_yards" in key and "ou" in key:\
+                    return "Player Passing Yards Over/Under"\
+                if "passing_touchdowns" in key and "ou" in key:\
+                    return "Player Passing TD Over/Under"\
+                if "receiving_receptions" in key and "ou" in key:\
+                    return "Player Receptions Over/Under"\
+                return market_key\
+\
+            # --- Fetch Data ---\
+            url = f"\{SGO_BASE\}/\{sport_slug\}/odds"\
+            try:\
+                r = requests.get(url, headers=headers, timeout=25)\
+                data = r.json() if r.status_code == 200 else \{\}\
+            except Exception:\
+                data = \{\}\
+\
+            rows = []\
+            leagues = data.get("leagues") or data.get("data") or data\
+            if isinstance(leagues, dict):\
+                leagues = [leagues]\
+\
+            for lg in leagues:\
+                league_name = lg.get("name") or lg.get("league") or ""\
+                events = lg.get("events") or lg.get("data") or []\
+                if isinstance(events, dict):\
+                    events = [events]\
+                for ev in events:\
+                    event_name = ev.get("name") or ev.get("event") or ev.get("matchup") or ""\
+                    markets = ev.get("markets") or ev.get("Markets") or []\
+                    if isinstance(markets, dict):\
+                        markets = [markets]\
+                    for mk in markets:\
+                        market_key = mk.get("key") or mk.get("market") or mk.get("name")\
+                        market_type = normalize_market_key(market_key)\
+                        selections = mk.get("selections") or mk.get("Selections") or []\
+                        if isinstance(selections, dict):\
+                            selections = [selections]\
+                        for sel in selections:\
+                            outcome = sel.get("name") or sel.get("outcome") or sel.get("selection")\
+                            line = sel.get("line") or sel.get("points") or sel.get("total")\
+                            am = sel.get("americanOdds") or sel.get("american")\
+                            dec = sel.get("decimalOdds") or sel.get("decimal")\
+                            if dec is None and am is not None:\
+                                dec = american_to_decimal(am)\
+                            book = normalize_book_name(sel.get("book") or sel.get("bookmaker"))\
+                            rows.append(\{\
+                                "Sport": sport_slug.upper(),\
+                                "League": league_name,\
+                                "Event": event_name,\
+                                "MarketType": market_type,\
+                                "MarketKey": market_key,\
+                                "Selection": outcome,\
+                                "Line": line,\
+                                "Bookmaker": book,\
+                                "AmericanOdds": am,\
+                                "DecimalOdds": dec\
+                            \})\
+\
+            sgo_df = pd.DataFrame(rows)\
+\
+            # --- Handle empty ---\
+            if sgo_df.empty:\
+                st.warning("\uc0\u9888 \u65039  No live SportsgameOdds data currently available.")\
+            else:\
+                # --- Filter by sportsbook ---\
+                if sb_filter != "All books":\
+                    sgo_df = sgo_df[sgo_df["Bookmaker"] == sb_filter]\
+\
+                # --- Market Type Filter ---\
+                unique_markets = sorted(sgo_df["MarketType"].dropna().unique())\
+                selected_markets = st.multiselect(\
+                    "\uc0\u55356 \u57263  Filter by Market Type",\
+                    options=unique_markets,\
+                    default=[],\
+                    help="Select one or more player prop types."\
+                )\
+                if selected_markets:\
+                    sgo_df = sgo_df[sgo_df["MarketType"].isin(selected_markets)]\
+\
+                # --- Add EV, Kelly, and RecBet columns ---\
+                sgo_df = add_value_columns(sgo_df, bankroll, 1 + edge_factor / 100.0)\
+\
+                # --- Filter by EV threshold ---\
+                display = sgo_df[sgo_df["EV_%"].fillna(-999) >= ev_threshold]\
+                display = display.sort_values(["MarketType", "Event", "EV_%"], ascending=[True, True, False])\
+\
+                st.success(f"\uc0\u9989  \{len(display):,\} props \u8805  \{ev_threshold\}% EV (based on model edge: \{edge_factor\}%)")\
+                st.dataframe(\
+                    display[\
+                        ["League", "Event", "MarketType", "Selection", "Line",\
+                         "Bookmaker", "AmericanOdds", "DecimalOdds",\
+                         "EV_%", "Kelly_%", "RecBet_$"]\
+                    ].sort_values(["League", "Event", "MarketType"]),\
+                    use_container_width=True\
+                )\
+\
+                # --- CSV download ---\
+                csv_sgo = display.to_csv(index=False).encode("utf-8")\
+                st.download_button(\
+                    "\uc0\u11015 \u65039  Download SportsgameOdds (CSV)",\
+                    csv_sgo,\
+                    f"sgo_props_\{sport_slug\}_\{today_str()\}.csv",\
+                    "text/csv",\
+                    use_container_width=True\
+                )\
+\
+                # --- Histogram ---\
+                histogram_ev(display, f"EV Distribution \'97 SportsgameOdds (\{sport\})")}
