@@ -1,7 +1,0 @@
-streamlit
-pandas
-numpy
-requests
-python-dotenv
-plotly
-streamlit-autorefresh
